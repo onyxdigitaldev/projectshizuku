@@ -1,6 +1,6 @@
 [package]
 name = "shizuku"
-version = "0.2.0"
+version = "0.3.0"
 description = "Project Shizuku - Anime streaming and management"
 authors = ["oskodiak"]
 edition = "2021"
@@ -24,3 +24,4 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 dirs = "5"
 futures-util = "0.3"
+sha2 = "0.10"

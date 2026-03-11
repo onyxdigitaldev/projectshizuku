@@ -10,6 +10,7 @@ pub struct DownloadEntry {
     pub anime_id: i64,
     pub title: String,
     pub episode: String,
+    pub barrel: String,
     pub file_path: Option<String>,
     pub status: String,
     pub progress: f64,
@@ -57,6 +58,7 @@ impl Database {
                 anime_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 episode TEXT NOT NULL,
+                barrel TEXT NOT NULL DEFAULT '',
                 file_path TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 progress REAL NOT NULL DEFAULT 0.0,
@@ -87,6 +89,10 @@ impl Database {
             INSERT OR IGNORE INTO settings (key, value) VALUES ('download_dir', '~/Shizuku');
             ",
         )?;
+        // Migration: add barrel column for existing databases
+        conn.execute_batch(
+            "ALTER TABLE downloads ADD COLUMN barrel TEXT NOT NULL DEFAULT '';"
+        ).ok();
         Ok(())
     }
 
@@ -148,12 +154,13 @@ impl Database {
         anime_id: i64,
         title: &str,
         episode: &str,
+        barrel: &str,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO downloads (anime_id, title, episode, status, progress)
-             VALUES (?1, ?2, ?3, 'queued', 0.0)",
-            rusqlite::params![anime_id, title, episode],
+            "INSERT OR REPLACE INTO downloads (anime_id, title, episode, barrel, status, progress)
+             VALUES (?1, ?2, ?3, ?4, 'queued', 0.0)",
+            rusqlite::params![anime_id, title, episode, barrel],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -161,7 +168,7 @@ impl Database {
     pub fn get_downloads(&self) -> Result<Vec<DownloadEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, anime_id, title, episode, file_path, status, progress
+            "SELECT id, anime_id, title, episode, barrel, file_path, status, progress
              FROM downloads ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -171,9 +178,10 @@ impl Database {
                     anime_id: row.get(1)?,
                     title: row.get(2)?,
                     episode: row.get(3)?,
-                    file_path: row.get(4)?,
-                    status: row.get(5)?,
-                    progress: row.get(6)?,
+                    barrel: row.get(4)?,
+                    file_path: row.get(5)?,
+                    status: row.get(6)?,
+                    progress: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

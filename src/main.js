@@ -11,6 +11,11 @@ let currentSources = [];
 let currentSourceIndex = 0;
 let activeGenre = null;
 let quitModalVisible = false;
+let genrePage = 1;
+let genreLoading = false;
+let genreHasMore = true;
+let downloadRefreshInterval = null;
+let passwordCallback = null;
 
 const GENRES = [
     'Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror',
@@ -36,14 +41,22 @@ function showView(name) {
     } else {
         $(`#${name}-view`).classList.remove('hidden');
     }
+
+    // Stop download refresh when leaving downloads view
+    if (name !== 'downloads') stopDownloadRefresh();
+
     currentView = name;
     updateStatus();
 }
 
+// Fix 1: remove error/stalled listeners before clearing video src
 function goBack() {
     if (currentView === 'player') {
-        $('#video-player').pause();
-        $('#video-player').src = '';
+        const video = $('#video-player');
+        video.removeEventListener('error', video._onError);
+        video.removeEventListener('stalled', video._onStalled);
+        video.pause();
+        video.src = '';
         showView('detail');
     } else if (currentView === 'search') {
         showView('home');
@@ -67,11 +80,24 @@ function updateStatus() {
         settings: 'settings',
         mokuroku: 'mokuroku',
     };
-    $('#status-line').textContent = `[${map[currentView] || currentView}]`;
+    const el = $('#status-line');
+    el.textContent = `[${map[currentView] || currentView}]`;
+    el.classList.remove('warning');
 }
 
 function setLoading(on) {
     $('#loading').classList.toggle('hidden', !on);
+}
+
+// Fix 6: warning helper
+function showWarning(msg) {
+    const el = $('#status-line');
+    el.textContent = `[warn: ${msg}]`;
+    el.classList.add('warning');
+    setTimeout(() => {
+        el.classList.remove('warning');
+        updateStatus();
+    }, 5000);
 }
 
 // --- Card rendering ---
@@ -129,7 +155,7 @@ async function loadHome() {
     initGenrePills();
 }
 
-// --- Genre browsing ---
+// --- Genre browsing (Fix 2: pagination) ---
 function initGenrePills() {
     const container = $('#genre-pills');
     container.innerHTML = '';
@@ -144,26 +170,56 @@ function initGenrePills() {
 
 async function browseGenre(genre) {
     activeGenre = genre;
-    // Update pill states
+    genrePage = 1;
+    genreHasMore = true;
     $$('.genre-pill').forEach(p => p.classList.toggle('active', p.textContent === genre.toLowerCase()));
-    // Show genre results, hide default
     $('#genre-results').classList.remove('hidden');
     $('#home-default').classList.add('hidden');
     $('#genre-results-title').textContent = `// ${genre.toLowerCase()}`;
+    $('#genre-results-grid').innerHTML = '';
     updateStatus();
+    await loadGenrePage(genre, 1);
+}
 
+async function loadGenrePage(genre, page) {
+    if (genreLoading || !genreHasMore) return;
+    genreLoading = true;
     setLoading(true);
     try {
-        const results = await invoke('browse_genre', { genre });
-        renderGrid($('#genre-results-grid'), results);
+        const results = await invoke('browse_genre', { genre, page });
+        if (!results || results.length === 0) {
+            genreHasMore = false;
+            if (page === 1) {
+                $('#genre-results-grid').innerHTML = '<div class="empty-state">no results found</div>';
+            }
+        } else {
+            results.forEach(a => $('#genre-results-grid').appendChild(renderCard(a)));
+            if (results.length < 30) genreHasMore = false;
+        }
     } catch (e) {
-        $('#genre-results-grid').innerHTML = `<div class="empty-state">failed to load: ${escapeHtml(String(e))}</div>`;
+        if (page === 1) {
+            $('#genre-results-grid').innerHTML = `<div class="empty-state">failed to load: ${escapeHtml(String(e))}</div>`;
+        }
     }
+    genreLoading = false;
     setLoading(false);
 }
 
+// Infinite scroll for genre browsing
+$('#app').addEventListener('scroll', () => {
+    if (!activeGenre || !genreHasMore || genreLoading) return;
+    const app = $('#app');
+    if (app.scrollTop + app.clientHeight >= app.scrollHeight - 200) {
+        genrePage++;
+        loadGenrePage(activeGenre, genrePage);
+    }
+});
+
 function clearGenre() {
     activeGenre = null;
+    genrePage = 1;
+    genreHasMore = true;
+    genreLoading = false;
     $$('.genre-pill').forEach(p => p.classList.remove('active'));
     $('#genre-results').classList.add('hidden');
     $('#home-default').classList.remove('hidden');
@@ -194,7 +250,10 @@ $('#search-input').addEventListener('input', (e) => {
 });
 
 $('#search-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' || (e.key === 'q' && !e.target.value)) {
+    if (e.key === 'Escape') {
+        showQuitModal();
+        e.preventDefault();
+    } else if (e.key === 'q' && !e.target.value) {
         showView('home');
         e.preventDefault();
     } else if (e.key === 'Enter') {
@@ -222,21 +281,17 @@ async function openAnimeDetail(anime) {
         $('#detail-banner').style.display = 'none';
     }
 
-    // Tags
     $('#detail-tags').innerHTML = (anime.genres || [])
         .map(g => `<span class="tag">${escapeHtml(g)}</span>`)
         .join('');
 
-    // Description
     const desc = (anime.description || 'No description available.')
         .replace(/<br\s*\/?>/gi, '\n')
         .replace(/<[^>]+>/g, '');
     $('#detail-description').textContent = desc;
 
-    // Mokuroku status
     updateMokurokuBadge(anime.id);
 
-    // Related series — fetch full detail with relations
     renderRelated([]);
     try {
         const fullAnime = await invoke('get_anime_detail', { id: anime.id });
@@ -247,7 +302,6 @@ async function openAnimeDetail(anime) {
         console.error('Failed to fetch relations:', e);
     }
 
-    // Load episodes from provider
     $('#episode-list').innerHTML = '<div class="empty-state">loading episodes...</div>';
     try {
         const providerResults = await invoke('provider_search', {
@@ -280,7 +334,6 @@ function renderRelated(relations) {
         other: { types: ['ALTERNATIVE', 'CHARACTER', 'SOURCE', 'COMPILATION', 'CONTAINS'], el: 'related-other', row: 'related-other-row' },
     };
 
-    // Hide all sections first
     $('#detail-related').classList.add('hidden');
     Object.values(sections).forEach(s => {
         $(`#${s.el}`).classList.add('hidden');
@@ -294,13 +347,11 @@ function renderRelated(relations) {
     Object.entries(sections).forEach(([key, sec]) => {
         let items;
         if (sec.formatMatch) {
-            // Match by format (MOVIE, OVA, ONA, SPECIAL)
             items = relations.filter(r => sec.types.includes(r.format || '') || sec.types.includes(r.relation_type));
         } else {
             items = relations.filter(r => sec.types.includes(r.relation_type));
         }
 
-        // For seasons, sort by year
         if (key === 'seasons') {
             items.sort((a, b) => (a.season_year || 0) - (b.season_year || 0));
         }
@@ -339,6 +390,7 @@ function renderRelated(relations) {
     }
 }
 
+// --- Episode rendering (Fix 3: download buttons) ---
 function renderEpisodes(episodes) {
     const container = $('#episode-list');
     container.innerHTML = '';
@@ -363,7 +415,7 @@ function renderEpisodes(episodes) {
         dlBtn.tabIndex = 0;
         dlBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            downloadEpisode(ep);
+            downloadEpisode(ep, determineBarrel());
         });
 
         wrapper.appendChild(btn);
@@ -371,6 +423,44 @@ function renderEpisodes(episodes) {
         container.appendChild(wrapper);
     });
 }
+
+// Fix 3: determine barrel name from current anime context
+function determineBarrel() {
+    if (!currentAnime) return '';
+    const format = currentAnime.format;
+    if (format === 'MOVIE') return 'Movies';
+    if (format === 'OVA' || format === 'ONA' || format === 'SPECIAL') return 'OVAs';
+    if (currentAnime.season && currentAnime.season_year) {
+        return `${currentAnime.season_year} ${currentAnime.season}`;
+    }
+    return 'Season 1';
+}
+
+// Fix 3: barrel download — download all episodes
+async function barrelDownload() {
+    if (!currentAnime || !currentShowId || currentEpisodes.length === 0) return;
+
+    const title = currentAnime.title_english || currentAnime.title_romaji || '';
+    const barrel = determineBarrel();
+    const total = currentEpisodes.length;
+
+    $('#status-line').textContent = `[barrel download: ${total} episodes queuing...]`;
+
+    for (let i = 0; i < currentEpisodes.length; i++) {
+        const ep = currentEpisodes[i];
+        try {
+            await downloadEpisode(ep, barrel);
+        } catch (e) {
+            console.error(`Barrel download failed for ep ${ep}:`, e);
+        }
+        $('#status-line').textContent = `[barrel: queued ${i + 1}/${total}]`;
+    }
+    $('#status-line').textContent = `[barrel download: all ${total} episodes queued]`;
+    setTimeout(updateStatus, 3000);
+}
+
+// Wire barrel download button
+$('#barrel-download-btn').addEventListener('click', barrelDownload);
 
 // --- Mokuroku badge ---
 async function updateMokurokuBadge(animeId) {
@@ -517,7 +607,13 @@ function trySource(title, epNumber) {
     const total = currentSources.length;
     const current = currentSourceIndex + 1;
 
-    $('#status-line').textContent = `[source ${current}/${total}: ${source.provider} ${source.quality}]`;
+    // Fix 6: warn about non-mp4 formats
+    if (!source.url.includes('.mp4')) {
+        $('#status-line').textContent = `[source ${current}/${total}: ${source.provider} ${source.quality} (non-mp4)]`;
+        $('#status-line').classList.add('warning');
+    } else {
+        $('#status-line').textContent = `[source ${current}/${total}: ${source.provider} ${source.quality}]`;
+    }
 
     const video = $('#video-player');
     video.removeEventListener('error', video._onError);
@@ -542,6 +638,7 @@ function trySource(title, epNumber) {
     video.addEventListener('playing', () => {
         if (stalledTimer) clearTimeout(stalledTimer);
         $('#status-line').textContent = `[playing: ${source.provider} ${source.quality}]`;
+        $('#status-line').classList.remove('warning');
     }, { once: true });
 
     video.src = source.url;
@@ -551,13 +648,13 @@ function trySource(title, epNumber) {
     });
 }
 
+// Fix 6: warn on mpv fallback
 async function fallbackToMpv(title, epNumber) {
     if (currentSources.length === 0) {
-        $('#status-line').textContent = '[error: no playable sources]';
-        setTimeout(updateStatus, 3000);
+        showWarning('no playable sources found');
         return;
     }
-    $('#status-line').textContent = '[falling back to mpv...]';
+    showWarning('embedded player failed — launching mpv');
     const source = currentSources[0];
     try {
         await invoke('play_in_mpv', {
@@ -568,25 +665,29 @@ async function fallbackToMpv(title, epNumber) {
         $('#status-line').textContent = '[playing in mpv]';
         setTimeout(() => showView('detail'), 1000);
     } catch (e) {
-        $('#status-line').textContent = `[mpv failed: ${e}]`;
-        setTimeout(updateStatus, 3000);
+        showWarning(`mpv failed: ${e}`);
     }
 }
 
-// --- Downloads ---
-async function downloadEpisode(epNumber) {
+// --- Downloads (Fix 4: barrel param, Fix 6: format warning) ---
+async function downloadEpisode(epNumber, barrel = '') {
     if (!currentAnime || !currentShowId) return;
     const title = currentAnime.title_english || currentAnime.title_romaji || '';
     try {
-        await invoke('start_download', {
+        const format = await invoke('start_download', {
             showId: currentShowId,
             animeId: currentAnime.id,
             animeTitle: title,
             episode: String(epNumber),
             mode: 'sub',
+            barrel: barrel,
         });
-        $('#status-line').textContent = `[downloading: ${title} ep${epNumber}]`;
-        setTimeout(updateStatus, 2000);
+        if (format === 'm3u8') {
+            showWarning(`ep${epNumber}: m3u8 stream — download via yt-dlp/ffmpeg, no progress`);
+        } else {
+            $('#status-line').textContent = `[downloading: ${title} ep${epNumber}]`;
+            setTimeout(updateStatus, 2000);
+        }
     } catch (e) {
         console.error('Download failed:', e);
         $('#status-line').textContent = `[download error: ${e}]`;
@@ -594,48 +695,104 @@ async function downloadEpisode(epNumber) {
     }
 }
 
+// Fix 5: hierarchical downloads view with auto-refresh
 async function loadDownloads() {
     showView('downloads');
     try {
         const downloads = await invoke('get_downloads');
-        const container = $('#download-list');
-        container.innerHTML = '';
-        if (!downloads.length) {
-            container.innerHTML = '<div class="empty-state">no downloads — press [d] on an episode to start one</div>';
-            return;
-        }
-        downloads.forEach(dl => {
-            const item = document.createElement('div');
-            item.className = 'download-item';
-            item.dataset.downloadId = dl.id;
-            const pct = Math.round(dl.progress * 100);
-            const statusColor = dl.status === 'complete' ? 'var(--green)' : dl.status === 'failed' ? 'var(--red)' : 'var(--text-dim)';
-            item.innerHTML = `
-                <span class="download-title">${escapeHtml(dl.title)}</span>
-                <div class="download-progress">
-                    <div class="download-progress-bar" style="width: ${pct}%"></div>
-                </div>
-                <span class="download-status" style="color: ${statusColor}">${dl.status} ${dl.status === 'downloading' ? pct + '%' : ''}</span>
-            `;
-            container.appendChild(item);
-        });
+        renderDownloadList(downloads);
     } catch (e) {
         $('#download-list').innerHTML = '<div class="empty-state">failed to load downloads</div>';
     }
+    startDownloadRefresh();
 }
 
-// Listen for download progress events
+function renderDownloadList(downloads) {
+    const container = $('#download-list');
+    container.innerHTML = '';
+    if (!downloads.length) {
+        container.innerHTML = '<div class="empty-state">no downloads — press [dl] on an episode or [dl all] for a barrel</div>';
+        return;
+    }
+
+    // Group by anime_id, then by barrel
+    const groups = {};
+    downloads.forEach(dl => {
+        const key = dl.anime_id;
+        if (!groups[key]) groups[key] = { title: dl.title.split(' - ')[0], barrels: {} };
+        const barrelKey = dl.barrel || '';
+        if (!groups[key].barrels[barrelKey]) groups[key].barrels[barrelKey] = [];
+        groups[key].barrels[barrelKey].push(dl);
+    });
+
+    Object.entries(groups).forEach(([animeId, group]) => {
+        const seriesHeader = document.createElement('div');
+        seriesHeader.className = 'download-series-header';
+        seriesHeader.textContent = group.title;
+        container.appendChild(seriesHeader);
+
+        Object.entries(group.barrels).forEach(([barrelName, items]) => {
+            if (barrelName) {
+                const barrelHeader = document.createElement('div');
+                barrelHeader.className = 'download-barrel-header';
+                barrelHeader.textContent = barrelName;
+                container.appendChild(barrelHeader);
+            }
+
+            items.forEach(dl => {
+                const item = document.createElement('div');
+                item.className = 'download-item';
+                item.dataset.downloadId = dl.id;
+                const pct = Math.round(dl.progress * 100);
+                const statusColor = dl.status === 'complete' ? 'var(--green)' : dl.status === 'failed' ? 'var(--red)' : 'var(--text-dim)';
+                const epLabel = `Ep ${dl.episode}`;
+                item.innerHTML = `
+                    <span class="download-title">${escapeHtml(epLabel)}</span>
+                    <div class="download-progress">
+                        <div class="download-progress-bar" style="width: ${pct}%"></div>
+                    </div>
+                    <span class="download-status" style="color: ${statusColor}">${dl.status} ${dl.status === 'downloading' ? pct + '%' : ''}</span>
+                `;
+                container.appendChild(item);
+            });
+        });
+    });
+}
+
+// Fix 8: auto-refresh downloads view
+function startDownloadRefresh() {
+    stopDownloadRefresh();
+    downloadRefreshInterval = setInterval(async () => {
+        if (currentView !== 'downloads') { stopDownloadRefresh(); return; }
+        try {
+            const downloads = await invoke('get_downloads');
+            if (downloads.some(dl => dl.status === 'downloading' || dl.status === 'queued')) {
+                renderDownloadList(downloads);
+            }
+        } catch {}
+    }, 3000);
+}
+
+function stopDownloadRefresh() {
+    if (downloadRefreshInterval) { clearInterval(downloadRefreshInterval); downloadRefreshInterval = null; }
+}
+
+// Fix 8: handle unknown total size in progress events
 listen('download-progress', (event) => {
-    const { id, progress } = event.payload;
+    const { id, progress, downloaded } = event.payload;
     const item = $(`.download-item[data-download-id="${id}"]`);
     if (item) {
         const bar = item.querySelector('.download-progress-bar');
         const status = item.querySelector('.download-status');
-        if (bar) bar.style.width = `${Math.round(progress * 100)}%`;
-        if (status) {
-            status.textContent = `downloading ${Math.round(progress * 100)}%`;
-            status.style.color = 'var(--text-dim)';
+        if (progress >= 0) {
+            if (bar) bar.style.width = `${Math.round(progress * 100)}%`;
+            if (status) status.textContent = `downloading ${Math.round(progress * 100)}%`;
+        } else {
+            if (bar) bar.style.width = '50%';
+            const mb = (downloaded / 1048576).toFixed(1);
+            if (status) status.textContent = `downloading ${mb} MB`;
         }
+        if (status) status.style.color = 'var(--text-dim)';
     }
 });
 
@@ -707,7 +864,7 @@ async function loadSettings() {
         adultItem.innerHTML = `
             <span class="settings-label">adult content</span>
             <span class="settings-value ${isAdult ? 'enabled' : ''}">${isAdult ? 'enabled' : 'disabled'}</span>
-            <span class="settings-hint">[Enter] toggle (requires authentication)</span>
+            <span class="settings-hint">[Enter] toggle (requires password)</span>
         `;
         adultItem.addEventListener('click', toggleAdult);
         adultItem.addEventListener('keydown', (e) => { if (e.key === 'Enter') toggleAdult(); });
@@ -717,17 +874,66 @@ async function loadSettings() {
     }
 }
 
+// Fix 7: in-app password auth instead of pkexec
 async function toggleAdult() {
     try {
-        $('#status-line').textContent = '[authenticating...]';
-        const newValue = await invoke('toggle_adult_content');
-        $('#status-line').textContent = `[adult content: ${newValue ? 'enabled' : 'disabled'}]`;
-        loadSettings();
-        loadHome();
+        const hasPassword = await invoke('has_adult_password');
+        if (!hasPassword) {
+            showPasswordModal('set adult content password', true, async (pw) => {
+                try {
+                    await invoke('set_adult_password', { password: pw });
+                    const result = await invoke('toggle_adult_content', { password: pw });
+                    $('#status-line').textContent = `[adult content: ${result ? 'enabled' : 'disabled'}]`;
+                    hidePasswordModal();
+                    loadSettings();
+                    loadHome();
+                } catch (e) {
+                    showPasswordError(String(e));
+                }
+            });
+        } else {
+            showPasswordModal('enter password to toggle adult content', false, async (pw) => {
+                try {
+                    const result = await invoke('toggle_adult_content', { password: pw });
+                    $('#status-line').textContent = `[adult content: ${result ? 'enabled' : 'disabled'}]`;
+                    hidePasswordModal();
+                    loadSettings();
+                    loadHome();
+                } catch (e) {
+                    if (String(e).includes('incorrect')) {
+                        showPasswordError('incorrect password');
+                    } else {
+                        showPasswordError(String(e));
+                    }
+                }
+            });
+        }
     } catch (e) {
-        $('#status-line').textContent = `[auth failed: ${e}]`;
+        $('#status-line').textContent = `[error: ${e}]`;
         setTimeout(updateStatus, 3000);
     }
+}
+
+// --- Password modal ---
+function showPasswordModal(title, needConfirm, callback) {
+    passwordCallback = callback;
+    $('#password-modal-title').textContent = title;
+    $('#password-input').value = '';
+    $('#password-confirm').value = '';
+    $('#password-modal-error').classList.add('hidden');
+    $('#password-modal-confirm-row').classList.toggle('hidden', !needConfirm);
+    $('#password-modal').classList.remove('hidden');
+    $('#password-input').focus();
+}
+
+function hidePasswordModal() {
+    passwordCallback = null;
+    $('#password-modal').classList.add('hidden');
+}
+
+function showPasswordError(msg) {
+    $('#password-modal-error').textContent = msg;
+    $('#password-modal-error').classList.remove('hidden');
 }
 
 // --- Quit modal ---
@@ -743,6 +949,24 @@ function hideQuitModal() {
 
 // --- Keyboard navigation ---
 document.addEventListener('keydown', (e) => {
+    // Password modal takes priority
+    if (!$('#password-modal').classList.contains('hidden')) {
+        if (e.key === 'Escape') {
+            hidePasswordModal();
+        } else if (e.key === 'Enter') {
+            const pw = $('#password-input').value;
+            const confirm = $('#password-confirm').value;
+            if (!$('#password-modal-confirm-row').classList.contains('hidden')) {
+                if (pw !== confirm) { showPasswordError('passwords do not match'); e.preventDefault(); return; }
+                if (pw.length < 4) { showPasswordError('password too short (min 4 chars)'); e.preventDefault(); return; }
+            }
+            if (!pw) { showPasswordError('password required'); e.preventDefault(); return; }
+            if (passwordCallback) passwordCallback(pw);
+        }
+        e.preventDefault();
+        return;
+    }
+
     // Quit modal takes priority
     if (quitModalVisible) {
         if (e.key === 'y' || e.key === 'Y') {
@@ -760,6 +984,11 @@ document.addEventListener('keydown', (e) => {
             showQuitModal();
             e.preventDefault();
         }
+        return;
+    }
+
+    // Don't capture when in password fields
+    if (document.activeElement === $('#password-input') || document.activeElement === $('#password-confirm')) {
         return;
     }
 

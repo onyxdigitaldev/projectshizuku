@@ -95,15 +95,17 @@ async fn get_anime_detail(
         .map_err(|e| e.to_string())
 }
 
+// Fix 2: page parameter for genre pagination
 #[tauri::command]
 async fn browse_genre(
     state: tauri::State<'_, Arc<AppState>>,
     genre: String,
+    page: i32,
 ) -> Result<Vec<Anime>, String> {
     let allow_adult = state.allow_adult();
     state
         .anilist
-        .browse_by_genre(&genre, 1, 30, allow_adult)
+        .browse_by_genre(&genre, page, 30, allow_adult)
         .await
         .map_err(|e| e.to_string())
 }
@@ -191,7 +193,6 @@ async fn check_local_file(
         .db
         .get_download_path(anime_id, &episode)
         .map_err(|e| e.to_string())?;
-    // Verify file still exists on disk
     if let Some(ref p) = path {
         if !std::path::Path::new(p).exists() {
             return Ok(None);
@@ -200,6 +201,8 @@ async fn check_local_file(
     Ok(path)
 }
 
+// Fix 4: barrel parameter for organized folders
+// Fix 6: returns format string ("mp4" or "m3u8") for frontend warnings
 #[tauri::command]
 async fn start_download(
     app_handle: tauri::AppHandle,
@@ -209,8 +212,8 @@ async fn start_download(
     anime_title: String,
     episode: String,
     mode: String,
-) -> Result<(), String> {
-    // Get sources
+    barrel: String,
+) -> Result<String, String> {
     let sources = state
         .allanime
         .get_episode_sources(&show_id, &episode, &mode)
@@ -221,7 +224,6 @@ async fn start_download(
         return Err("No sources available".to_string());
     }
 
-    // Prefer mp4
     let source = sources
         .iter()
         .find(|s| s.url.contains(".mp4"))
@@ -229,27 +231,37 @@ async fn start_download(
         .cloned()
         .ok_or("No source found")?;
 
-    // Create download directory
+    // Create download directory with barrel subfolder
     let download_dir = state.download_dir();
     let safe_title = anime_title
         .chars()
         .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
         .collect::<String>();
     let anime_dir = download_dir.join(&safe_title);
-    std::fs::create_dir_all(&anime_dir).map_err(|e| e.to_string())?;
+    let target_dir = if barrel.is_empty() {
+        anime_dir
+    } else {
+        anime_dir.join(&barrel)
+    };
+    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
     let file_name = format!("Episode_{}.mp4", episode);
-    let file_path = anime_dir.join(&file_name);
+    let file_path = target_dir.join(&file_name);
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // Queue in DB
     let download_id = state
         .db
-        .queue_download(anime_id, &format!("{} - Episode {}", anime_title, episode), &episode)
+        .queue_download(
+            anime_id,
+            &format!("{} - Episode {}", anime_title, episode),
+            &episode,
+            &barrel,
+        )
         .map_err(|e| e.to_string())?;
 
-    // Check if it's an m3u8 stream — use ffmpeg/yt-dlp
-    if source.url.contains("m3u8") {
+    let is_m3u8 = source.url.contains("m3u8");
+
+    if is_m3u8 {
         let url = source.url.clone();
         let fp = file_path_str.clone();
         let ah = app_handle.clone();
@@ -290,7 +302,7 @@ async fn start_download(
             }
         });
 
-        return Ok(());
+        return Ok("m3u8".to_string());
     }
 
     // Direct download via reqwest streaming
@@ -312,9 +324,10 @@ async fn start_download(
         }
     });
 
-    Ok(())
+    Ok("mp4".to_string())
 }
 
+// Fix 8: emit progress even when total_size is unknown
 async fn download_file(
     url: &str,
     file_path: &str,
@@ -338,13 +351,23 @@ async fn download_file(
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
 
-        // Emit progress every ~100KB to avoid flooding
-        if total_size > 0 && downloaded - last_emit > 102400 {
-            let progress = downloaded as f64 / total_size as f64;
-            let _ = state.db.update_download_progress(download_id, progress);
+        if downloaded - last_emit > 102400 {
+            let progress = if total_size > 0 {
+                downloaded as f64 / total_size as f64
+            } else {
+                -1.0
+            };
+            let _ = state.db.update_download_progress(
+                download_id,
+                if progress >= 0.0 { progress } else { 0.0 },
+            );
             let _ = app_handle.emit(
                 "download-progress",
-                serde_json::json!({ "id": download_id, "progress": progress }),
+                serde_json::json!({
+                    "id": download_id,
+                    "progress": progress,
+                    "downloaded": downloaded
+                }),
             );
             last_emit = downloaded;
         }
@@ -424,17 +447,51 @@ async fn get_settings(
     Ok(settings)
 }
 
+// Fix 7: password-based auth instead of pkexec
+#[tauri::command]
+async fn has_adult_password(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let hash = state
+        .db
+        .get_setting("adult_password_hash")
+        .map_err(|e| e.to_string())?;
+    Ok(hash.is_some())
+}
+
+#[tauri::command]
+async fn set_adult_password(
+    state: tauri::State<'_, Arc<AppState>>,
+    password: String,
+) -> Result<(), String> {
+    use sha2::{Sha256, Digest};
+    let hash = format!("{:x}", Sha256::digest(password.as_bytes()));
+    state
+        .db
+        .set_setting("adult_password_hash", &hash)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn toggle_adult_content(
     state: tauri::State<'_, Arc<AppState>>,
+    password: String,
 ) -> Result<bool, String> {
-    let status = std::process::Command::new("pkexec")
-        .arg("/bin/true")
-        .status()
-        .map_err(|e| format!("Failed to run pkexec: {}", e))?;
+    use sha2::{Sha256, Digest};
 
-    if !status.success() {
-        return Err("Authentication failed".to_string());
+    let stored_hash = state
+        .db
+        .get_setting("adult_password_hash")
+        .map_err(|e| e.to_string())?;
+
+    match stored_hash {
+        None => return Err("no_password_set".to_string()),
+        Some(hash) => {
+            let input_hash = format!("{:x}", Sha256::digest(password.as_bytes()));
+            if input_hash != hash {
+                return Err("incorrect_password".to_string());
+            }
+        }
     }
 
     let current = state.allow_adult();
@@ -516,6 +573,8 @@ pub fn run() {
             get_mokuroku,
             is_in_mokuroku,
             get_settings,
+            has_adult_password,
+            set_adult_password,
             toggle_adult_content,
             play_in_mpv,
             quit_app,
