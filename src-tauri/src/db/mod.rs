@@ -1,0 +1,269 @@
+use anyhow::Result;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadEntry {
+    pub id: i64,
+    pub anime_id: i64,
+    pub title: String,
+    pub episode: String,
+    pub file_path: Option<String>,
+    pub status: String,
+    pub progress: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MokurokuEntry {
+    pub anime_id: i64,
+    pub title: String,
+    pub cover_image: Option<String>,
+    pub added_at: String,
+}
+
+pub struct Database {
+    conn: Mutex<Connection>,
+}
+
+impl Database {
+    pub fn new(data_dir: &PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let db_path = data_dir.join("shizuku.db");
+        let conn = Connection::open(db_path)?;
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
+        db.init_tables()?;
+        Ok(db)
+    }
+
+    fn init_tables(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS watch_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anime_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                episode TEXT NOT NULL,
+                watched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(anime_id, episode)
+            );
+
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anime_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                episode TEXT NOT NULL,
+                file_path TEXT,
+                status TEXT NOT NULL DEFAULT 'queued',
+                progress REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(anime_id, episode)
+            );
+
+            CREATE TABLE IF NOT EXISTS mokuroku (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anime_id INTEGER NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                cover_image TEXT,
+                added_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('allow_adult', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('download_dir', '~/Shizuku');
+            ",
+        )?;
+        Ok(())
+    }
+
+    // --- Settings ---
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let result = stmt
+            .query_row(rusqlite::params![key], |row| row.get::<_, String>(0))
+            .ok();
+        Ok(result)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // --- Watch History ---
+
+    pub fn add_to_history(&self, anime_id: i64, title: &str, episode: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO watch_history (anime_id, title, episode, watched_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            rusqlite::params![anime_id, title, episode],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_history(&self, limit: i32) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT anime_id, title, episode, watched_at FROM watch_history
+             ORDER BY watched_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // --- Downloads ---
+
+    pub fn queue_download(
+        &self,
+        anime_id: i64,
+        title: &str,
+        episode: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO downloads (anime_id, title, episode, status, progress)
+             VALUES (?1, ?2, ?3, 'queued', 0.0)",
+            rusqlite::params![anime_id, title, episode],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_downloads(&self) -> Result<Vec<DownloadEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, anime_id, title, episode, file_path, status, progress
+             FROM downloads ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DownloadEntry {
+                    id: row.get(0)?,
+                    anime_id: row.get(1)?,
+                    title: row.get(2)?,
+                    episode: row.get(3)?,
+                    file_path: row.get(4)?,
+                    status: row.get(5)?,
+                    progress: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_download_progress(&self, id: i64, progress: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE downloads SET progress = ?1, status = 'downloading' WHERE id = ?2",
+            rusqlite::params![progress, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_download_complete(&self, id: i64, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE downloads SET status = 'complete', progress = 1.0, file_path = ?1 WHERE id = ?2",
+            rusqlite::params![file_path, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_download_failed(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE downloads SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_download_path(&self, anime_id: i64, episode: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file_path FROM downloads WHERE anime_id = ?1 AND episode = ?2 AND status = 'complete'",
+        )?;
+        let result = stmt
+            .query_row(rusqlite::params![anime_id, episode], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .ok()
+            .flatten();
+        Ok(result)
+    }
+
+    // --- Mokuroku (Watchlist) ---
+
+    pub fn add_to_mokuroku(&self, anime_id: i64, title: &str, cover_image: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO mokuroku (anime_id, title, cover_image, added_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            rusqlite::params![anime_id, title, cover_image],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_from_mokuroku(&self, anime_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM mokuroku WHERE anime_id = ?1",
+            rusqlite::params![anime_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_mokuroku(&self) -> Result<Vec<MokurokuEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT anime_id, title, cover_image, added_at FROM mokuroku ORDER BY added_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MokurokuEntry {
+                    anime_id: row.get(0)?,
+                    title: row.get(1)?,
+                    cover_image: row.get(2)?,
+                    added_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn is_in_mokuroku(&self, anime_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM mokuroku WHERE anime_id = ?1")?;
+        let count: i32 = stmt.query_row(rusqlite::params![anime_id], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+}

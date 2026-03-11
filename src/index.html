@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>shizuku</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <!-- Custom titlebar for dragging -->
+    <div id="titlebar" data-tauri-drag-region>
+        <span class="titlebar-brand">shizuku<span class="version">v0.2.0</span></span>
+        <span class="titlebar-status" id="status-line"></span>
+        <div class="titlebar-controls">
+            <span class="hint">[/] search  [h] home  [w] mokuroku  [d] downloads  [s] settings  [q] back  [Esc] quit</span>
+        </div>
+    </div>
+
+    <!-- Main content area -->
+    <div id="app">
+        <!-- Search overlay -->
+        <div id="search-overlay" class="hidden">
+            <div class="search-box">
+                <span class="prompt">&gt; </span>
+                <input type="text" id="search-input" placeholder="search anime..." autocomplete="off" spellcheck="false" />
+            </div>
+            <div id="search-results" class="card-grid"></div>
+        </div>
+
+        <!-- Home view -->
+        <div id="home-view">
+            <!-- Genre bar -->
+            <div id="genre-bar" class="section">
+                <h2 class="section-title">// browse by genre</h2>
+                <div id="genre-pills"></div>
+            </div>
+            <!-- Genre results (replaces trending/updated when active) -->
+            <div id="genre-results" class="hidden">
+                <div class="section">
+                    <h2 class="section-title" id="genre-results-title">// genre</h2>
+                    <div id="genre-results-grid" class="card-grid"></div>
+                </div>
+            </div>
+            <!-- Default home content -->
+            <div id="home-default">
+                <div class="section">
+                    <h2 class="section-title">// trending</h2>
+                    <div id="trending-grid" class="card-grid"></div>
+                </div>
+                <div class="section">
+                    <h2 class="section-title">// recently updated</h2>
+                    <div id="updated-grid" class="card-grid"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Anime detail view -->
+        <div id="detail-view" class="hidden">
+            <div id="detail-banner"></div>
+            <div id="detail-content">
+                <div id="detail-info">
+                    <img id="detail-cover" src="" alt="" />
+                    <div id="detail-meta">
+                        <h1 id="detail-title"></h1>
+                        <div id="detail-subtitle"></div>
+                        <div id="detail-actions">
+                            <span id="mokuroku-badge" class="hidden">[m] remove from mokuroku</span>
+                            <span id="mokuroku-add" class="hidden">[m] add to mokuroku</span>
+                        </div>
+                        <div id="detail-tags"></div>
+                        <p id="detail-description"></p>
+                    </div>
+                </div>
+                <!-- Related series -->
+                <div id="detail-related" class="hidden">
+                    <div id="related-seasons" class="hidden">
+                        <h2 class="section-title">// seasons</h2>
+                        <div class="related-row" id="related-seasons-row"></div>
+                    </div>
+                    <div id="related-movies" class="hidden">
+                        <h2 class="section-title">// movies</h2>
+                        <div class="related-row" id="related-movies-row"></div>
+                    </div>
+                    <div id="related-ovas" class="hidden">
+                        <h2 class="section-title">// OVAs &amp; specials</h2>
+                        <div class="related-row" id="related-ovas-row"></div>
+                    </div>
+                    <div id="related-spinoffs" class="hidden">
+                        <h2 class="section-title">// spin-offs &amp; side stories</h2>
+                        <div class="related-row" id="related-spinoffs-row"></div>
+                    </div>
+                    <div id="related-other" class="hidden">
+                        <h2 class="section-title">// related</h2>
+                        <div class="related-row" id="related-other-row"></div>
+                    </div>
+                </div>
+                <div id="episode-section">
+                    <h2 class="section-title">// episodes</h2>
+                    <div id="episode-list"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Player view -->
+        <div id="player-view" class="hidden">
+            <div id="player-header">
+                <span id="player-title"></span>
+                <span class="hint">[q] back  [f] fullscreen</span>
+            </div>
+            <video id="video-player" controls autoplay></video>
+        </div>
+
+        <!-- Downloads view -->
+        <div id="downloads-view" class="hidden">
+            <h2 class="section-title">// downloads</h2>
+            <div id="download-list"></div>
+        </div>
+
+        <!-- History view -->
+        <div id="history-view" class="hidden">
+            <h2 class="section-title">// watch history</h2>
+            <div id="history-list"></div>
+        </div>
+
+        <!-- Settings view -->
+        <div id="settings-view" class="hidden">
+            <h2 class="section-title">// settings</h2>
+            <div id="settings-list"></div>
+        </div>
+
+        <!-- Mokuroku (Watchlist) view -->
+        <div id="mokuroku-view" class="hidden">
+            <h2 class="section-title">// mokuroku</h2>
+            <div id="mokuroku-grid" class="card-grid"></div>
+        </div>
+    </div>
+
+    <!-- Quit confirmation modal -->
+    <div id="quit-modal" class="hidden">
+        <div class="modal-box">
+            <p>are you sure you want to quit?</p>
+            <p class="modal-hint">[y] yes  [n] no</p>
+        </div>
+    </div>
+
+    <!-- Loading indicator -->
+    <div id="loading" class="hidden">
+        <div class="spinner"></div>
+    </div>
+
+    <script src="main.js" type="module"></script>
+</body>
+</html>

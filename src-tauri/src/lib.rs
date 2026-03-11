@@ -1,0 +1,525 @@
+mod api;
+mod db;
+mod providers;
+
+use api::anilist::{Anime, AniListClient};
+use db::{Database, DownloadEntry, MokurokuEntry};
+use providers::allanime::{AllAnimeClient, AllAnimeShow, EpisodeSource};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
+use tokio::io::AsyncWriteExt;
+
+struct AppState {
+    anilist: AniListClient,
+    allanime: AllAnimeClient,
+    db: Database,
+}
+
+impl AppState {
+    fn allow_adult(&self) -> bool {
+        self.db
+            .get_setting("allow_adult")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
+    fn download_dir(&self) -> PathBuf {
+        let dir = self
+            .db
+            .get_setting("download_dir")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "~/Shizuku".to_string());
+        let expanded = if dir.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&dir[2..])
+            } else {
+                PathBuf::from(&dir)
+            }
+        } else {
+            PathBuf::from(&dir)
+        };
+        expanded
+    }
+}
+
+// --- AniList commands ---
+
+#[tauri::command]
+async fn search_anime(
+    state: tauri::State<'_, Arc<AppState>>,
+    query: String,
+) -> Result<Vec<Anime>, String> {
+    let allow_adult = state.allow_adult();
+    state
+        .anilist
+        .search(&query, 1, 20, allow_adult)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_trending(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Anime>, String> {
+    let allow_adult = state.allow_adult();
+    state
+        .anilist
+        .trending(1, 20, allow_adult)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_recently_updated(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<Anime>, String> {
+    let allow_adult = state.allow_adult();
+    state
+        .anilist
+        .recently_updated(1, 20, allow_adult)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_anime_detail(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<Anime, String> {
+    state
+        .anilist
+        .get_anime(id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn browse_genre(
+    state: tauri::State<'_, Arc<AppState>>,
+    genre: String,
+) -> Result<Vec<Anime>, String> {
+    let allow_adult = state.allow_adult();
+    state
+        .anilist
+        .browse_by_genre(&genre, 1, 30, allow_adult)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// --- AllAnime provider commands ---
+
+#[tauri::command]
+async fn provider_search(
+    state: tauri::State<'_, Arc<AppState>>,
+    query: String,
+    mode: String,
+) -> Result<Vec<AllAnimeShow>, String> {
+    state
+        .allanime
+        .search(&query, &mode)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_episodes(
+    state: tauri::State<'_, Arc<AppState>>,
+    show_id: String,
+    mode: String,
+) -> Result<Vec<String>, String> {
+    state
+        .allanime
+        .get_episodes(&show_id, &mode)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_episode_sources(
+    state: tauri::State<'_, Arc<AppState>>,
+    show_id: String,
+    episode: String,
+    mode: String,
+) -> Result<Vec<EpisodeSource>, String> {
+    state
+        .allanime
+        .get_episode_sources(&show_id, &episode, &mode)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// --- History commands ---
+
+#[tauri::command]
+async fn add_to_history(
+    state: tauri::State<'_, Arc<AppState>>,
+    anime_id: i64,
+    title: String,
+    episode: String,
+) -> Result<(), String> {
+    state
+        .db
+        .add_to_history(anime_id, &title, &episode)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_history(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<(i64, String, String, String)>, String> {
+    state.db.get_history(50).map_err(|e| e.to_string())
+}
+
+// --- Download commands ---
+
+#[tauri::command]
+async fn get_downloads(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<DownloadEntry>, String> {
+    state.db.get_downloads().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_local_file(
+    state: tauri::State<'_, Arc<AppState>>,
+    anime_id: i64,
+    episode: String,
+) -> Result<Option<String>, String> {
+    let path = state
+        .db
+        .get_download_path(anime_id, &episode)
+        .map_err(|e| e.to_string())?;
+    // Verify file still exists on disk
+    if let Some(ref p) = path {
+        if !std::path::Path::new(p).exists() {
+            return Ok(None);
+        }
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+async fn start_download(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    show_id: String,
+    anime_id: i64,
+    anime_title: String,
+    episode: String,
+    mode: String,
+) -> Result<(), String> {
+    // Get sources
+    let sources = state
+        .allanime
+        .get_episode_sources(&show_id, &episode, &mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if sources.is_empty() {
+        return Err("No sources available".to_string());
+    }
+
+    // Prefer mp4
+    let source = sources
+        .iter()
+        .find(|s| s.url.contains(".mp4"))
+        .or(sources.first())
+        .cloned()
+        .ok_or("No source found")?;
+
+    // Create download directory
+    let download_dir = state.download_dir();
+    let safe_title = anime_title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
+        .collect::<String>();
+    let anime_dir = download_dir.join(&safe_title);
+    std::fs::create_dir_all(&anime_dir).map_err(|e| e.to_string())?;
+
+    let file_name = format!("Episode_{}.mp4", episode);
+    let file_path = anime_dir.join(&file_name);
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    // Queue in DB
+    let download_id = state
+        .db
+        .queue_download(anime_id, &format!("{} - Episode {}", anime_title, episode), &episode)
+        .map_err(|e| e.to_string())?;
+
+    // Check if it's an m3u8 stream — use ffmpeg/yt-dlp
+    if source.url.contains("m3u8") {
+        let url = source.url.clone();
+        let fp = file_path_str.clone();
+        let ah = app_handle.clone();
+        let db_ref = state.inner().clone();
+
+        tokio::spawn(async move {
+            let status = if command_exists("yt-dlp") {
+                tokio::process::Command::new("yt-dlp")
+                    .arg(&url)
+                    .arg("--no-skip-unavailable-fragments")
+                    .arg("-N").arg("16")
+                    .arg("-o").arg(&fp)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+            } else {
+                tokio::process::Command::new("ffmpeg")
+                    .arg("-i").arg(&url)
+                    .arg("-c").arg("copy")
+                    .arg("-loglevel").arg("error")
+                    .arg(&fp)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+            };
+
+            match status {
+                Ok(s) if s.success() => {
+                    let _ = db_ref.db.update_download_complete(download_id, &fp);
+                    let _ = ah.emit("download-complete", serde_json::json!({ "id": download_id, "file_path": fp }));
+                }
+                _ => {
+                    let _ = db_ref.db.update_download_failed(download_id);
+                    let _ = ah.emit("download-failed", serde_json::json!({ "id": download_id }));
+                }
+            }
+        });
+
+        return Ok(());
+    }
+
+    // Direct download via reqwest streaming
+    let url = source.url.clone();
+    let fp = file_path_str.clone();
+    let ah = app_handle.clone();
+    let db_ref = state.inner().clone();
+
+    tokio::spawn(async move {
+        match download_file(&url, &fp, download_id, &ah, &db_ref).await {
+            Ok(()) => {
+                let _ = db_ref.db.update_download_complete(download_id, &fp);
+                let _ = ah.emit("download-complete", serde_json::json!({ "id": download_id, "file_path": fp }));
+            }
+            Err(_) => {
+                let _ = db_ref.db.update_download_failed(download_id);
+                let _ = ah.emit("download-failed", serde_json::json!({ "id": download_id }));
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn download_file(
+    url: &str,
+    file_path: &str,
+    download_id: i64,
+    app_handle: &tauri::AppHandle,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use futures_util::StreamExt;
+
+    let client = reqwest::Client::new();
+    let resp = client.get(url).send().await?;
+    let total_size = resp.content_length().unwrap_or(0);
+
+    let mut file = tokio::fs::File::create(file_path).await?;
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = 0;
+    let mut last_emit: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+
+        // Emit progress every ~100KB to avoid flooding
+        if total_size > 0 && downloaded - last_emit > 102400 {
+            let progress = downloaded as f64 / total_size as f64;
+            let _ = state.db.update_download_progress(download_id, progress);
+            let _ = app_handle.emit(
+                "download-progress",
+                serde_json::json!({ "id": download_id, "progress": progress }),
+            );
+            last_emit = downloaded;
+        }
+    }
+
+    file.flush().await?;
+    Ok(())
+}
+
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// --- Mokuroku (Watchlist) commands ---
+
+#[tauri::command]
+async fn add_to_mokuroku(
+    state: tauri::State<'_, Arc<AppState>>,
+    anime_id: i64,
+    title: String,
+    cover_image: Option<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .add_to_mokuroku(anime_id, &title, cover_image.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_from_mokuroku(
+    state: tauri::State<'_, Arc<AppState>>,
+    anime_id: i64,
+) -> Result<(), String> {
+    state
+        .db
+        .remove_from_mokuroku(anime_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_mokuroku(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<MokurokuEntry>, String> {
+    state.db.get_mokuroku().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn is_in_mokuroku(
+    state: tauri::State<'_, Arc<AppState>>,
+    anime_id: i64,
+) -> Result<bool, String> {
+    state
+        .db
+        .is_in_mokuroku(anime_id)
+        .map_err(|e| e.to_string())
+}
+
+// --- Settings commands ---
+
+#[tauri::command]
+async fn get_settings(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut settings = std::collections::HashMap::new();
+    let allow_adult = state
+        .db
+        .get_setting("allow_adult")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "false".to_string());
+    settings.insert("allow_adult".to_string(), allow_adult);
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn toggle_adult_content(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let status = std::process::Command::new("pkexec")
+        .arg("/bin/true")
+        .status()
+        .map_err(|e| format!("Failed to run pkexec: {}", e))?;
+
+    if !status.success() {
+        return Err("Authentication failed".to_string());
+    }
+
+    let current = state.allow_adult();
+    let new_value = if current { "false" } else { "true" };
+    state
+        .db
+        .set_setting("allow_adult", new_value)
+        .map_err(|e| e.to_string())?;
+    Ok(!current)
+}
+
+// --- Quit command ---
+
+#[tauri::command]
+async fn quit_app(app_handle: tauri::AppHandle) -> Result<(), String> {
+    app_handle.exit(0);
+    Ok(())
+}
+
+// --- mpv fallback command ---
+
+#[tauri::command]
+async fn play_in_mpv(
+    url: String,
+    title: String,
+    referrer: Option<String>,
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("mpv");
+    cmd.arg(&url);
+    cmd.arg(format!("--force-media-title={}", title));
+
+    if let Some(refr) = referrer {
+        cmd.arg(format!("--referrer={}", refr));
+    }
+
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch mpv: {}", e))?;
+
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from("."));
+
+            let state = Arc::new(AppState {
+                anilist: AniListClient::new(),
+                allanime: AllAnimeClient::new(),
+                db: Database::new(&data_dir).expect("Failed to initialize database"),
+            });
+
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            search_anime,
+            get_trending,
+            get_recently_updated,
+            get_anime_detail,
+            browse_genre,
+            provider_search,
+            get_episodes,
+            get_episode_sources,
+            add_to_history,
+            get_history,
+            get_downloads,
+            check_local_file,
+            start_download,
+            add_to_mokuroku,
+            remove_from_mokuroku,
+            get_mokuroku,
+            is_in_mokuroku,
+            get_settings,
+            toggle_adult_content,
+            play_in_mpv,
+            quit_app,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running shizuku");
+}
