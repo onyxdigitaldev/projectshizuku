@@ -319,15 +319,21 @@ html, body {
 /* Episode list */
 #episode-list {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
     gap: 8px;
+}
+
+.episode-item {
+    display: flex;
+    gap: 0;
 }
 
 .episode-btn {
     padding: 8px 12px;
     background: var(--bg-card);
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-right: none;
+    border-radius: 3px 0 0 3px;
     color: var(--text);
     font-family: inherit;
     font-size: 12px;
@@ -335,6 +341,7 @@ html, body {
     text-align: center;
     transition: border-color 0.15s, background 0.15s;
     outline: none;
+    flex: 1;
 }
 
 .episode-btn:hover, .episode-btn:focus, .episode-btn.selected {
@@ -345,6 +352,25 @@ html, body {
 
 .episode-btn.watched {
     border-left: 2px solid var(--green);
+}
+
+.episode-dl-btn {
+    padding: 8px 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0 3px 3px 0;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 10px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+    outline: none;
+}
+
+.episode-dl-btn:hover, .episode-dl-btn:focus {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+    color: var(--text-bright);
 }
 
 /* Player view */

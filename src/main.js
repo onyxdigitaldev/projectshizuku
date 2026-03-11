@@ -347,16 +347,28 @@ function renderEpisodes(episodes) {
         return;
     }
     episodes.forEach((ep) => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'episode-item';
+
         const btn = document.createElement('button');
         btn.className = 'episode-btn';
         btn.textContent = `Ep ${ep}`;
         btn.tabIndex = 0;
         btn.addEventListener('click', () => playEpisode(ep));
-        btn.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') playEpisode(ep);
-            if (e.key === 'd') downloadEpisode(ep);
+
+        const dlBtn = document.createElement('button');
+        dlBtn.className = 'episode-dl-btn';
+        dlBtn.textContent = 'dl';
+        dlBtn.title = 'download episode';
+        dlBtn.tabIndex = 0;
+        dlBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            downloadEpisode(ep);
         });
-        container.appendChild(btn);
+
+        wrapper.appendChild(btn);
+        wrapper.appendChild(dlBtn);
+        container.appendChild(wrapper);
     });
 }
 
@@ -768,16 +780,16 @@ document.addEventListener('keydown', (e) => {
             clearGenre();
             break;
         case 'd':
-            if (currentView === 'home') loadDownloads();
+            loadDownloads();
             break;
         case 'r':
-            if (currentView === 'home') loadHistory();
+            loadHistory();
             break;
         case 's':
-            if (currentView === 'home') loadSettings();
+            loadSettings();
             break;
         case 'w':
-            if (currentView === 'home') loadMokuroku();
+            loadMokuroku();
             break;
         case 'm':
             if (currentView === 'detail') toggleMokuroku();
