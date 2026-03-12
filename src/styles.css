@@ -759,6 +759,13 @@ body::after {
     color: var(--text-bright);
 }
 
+/* Download controls */
+.download-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
 /* Download hierarchy */
 .download-series-header {
     color: var(--accent-bright);
@@ -790,6 +797,43 @@ body::after {
 .titlebar-status.warning {
     color: var(--yellow);
     font-weight: 500;
+}
+
+/* Disclaimer modal */
+#disclaimer-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(10, 10, 15, 0.95);
+    z-index: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.disclaimer-box {
+    max-width: 520px;
+}
+
+.disclaimer-title {
+    color: var(--accent-bright);
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 20px;
+}
+
+.disclaimer-text {
+    text-align: left;
+    margin-bottom: 20px;
+}
+
+.disclaimer-text p {
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.7;
+    margin-bottom: 10px;
 }
 
 /* Adult content modal */

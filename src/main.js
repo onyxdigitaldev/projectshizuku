@@ -16,6 +16,8 @@ let genreLoading = false;
 let genreHasMore = true;
 let downloadRefreshInterval = null;
 let adultModalVisible = false;
+let disclaimerVisible = false;
+let currentEpisodeNumber = null;
 
 const GENRES = [
     'Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror',
@@ -55,6 +57,7 @@ function goBack() {
         const video = $('#video-player');
         video.removeEventListener('error', video._onError);
         video.removeEventListener('stalled', video._onStalled);
+        video.removeEventListener('ended', video._onEnded);
         video.pause();
         video.src = '';
         showView('detail');
@@ -141,18 +144,56 @@ function renderGrid(container, animeList) {
 async function loadHome() {
     setLoading(true);
     try {
-        const [trending, updated] = await Promise.all([
+        const [trending, updated, continueList] = await Promise.all([
             invoke('get_trending'),
             invoke('get_recently_updated'),
+            invoke('get_continue_watching').catch(() => []),
         ]);
         renderGrid($('#trending-grid'), trending);
         renderGrid($('#updated-grid'), updated);
+        renderContinueWatching(continueList);
     } catch (e) {
         console.error('Failed to load home:', e);
         $('#trending-grid').innerHTML = `<div class="empty-state">failed to load: ${escapeHtml(String(e))}</div>`;
     }
     setLoading(false);
     initGenrePills();
+}
+
+function renderContinueWatching(list) {
+    const section = $('#continue-section');
+    const grid = $('#continue-grid');
+    if (!list || list.length === 0) {
+        section.classList.add('hidden');
+        return;
+    }
+    section.classList.remove('hidden');
+    grid.innerHTML = '';
+    list.forEach(([animeId, title, episode, watchedAt]) => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.tabIndex = 0;
+        card.innerHTML = `
+            <div class="card-body">
+                <div class="card-title">${escapeHtml(title)}</div>
+                <div class="card-meta">
+                    <span class="card-score">ep ${escapeHtml(episode)}</span>
+                    <span class="card-status">${escapeHtml(watchedAt.split('T')[0])}</span>
+                </div>
+            </div>
+        `;
+        const handler = async () => {
+            try {
+                const fullAnime = await invoke('get_anime_detail', { id: animeId });
+                openAnimeDetail(fullAnime);
+            } catch (e) {
+                console.error('Failed to open from continue:', e);
+            }
+        };
+        card.addEventListener('click', handler);
+        card.addEventListener('keydown', (e) => { if (e.key === 'Enter') handler(); });
+        grid.appendChild(card);
+    });
 }
 
 // --- Genre browsing (Fix 2: pagination) ---
@@ -304,10 +345,11 @@ async function openAnimeDetail(anime) {
 
     $('#episode-list').innerHTML = '<div class="empty-state">loading episodes...</div>';
     try {
-        const providerResults = await invoke('provider_search', {
-            query: romaji || title,
-            mode: 'sub',
-        });
+        const [providerResults, watchedEps] = await Promise.all([
+            invoke('provider_search', { query: romaji || title, mode: 'sub' }),
+            invoke('get_watched_episodes', { animeId: anime.id }).catch(() => []),
+        ]);
+        const watchedSet = new Set(watchedEps);
         if (providerResults.length > 0) {
             currentShowId = providerResults[0].id;
             const episodes = await invoke('get_episodes', {
@@ -315,7 +357,7 @@ async function openAnimeDetail(anime) {
                 mode: 'sub',
             });
             currentEpisodes = episodes;
-            renderEpisodes(episodes);
+            renderEpisodes(episodes, watchedSet);
         } else {
             $('#episode-list').innerHTML = '<div class="empty-state">no sources found for this anime</div>';
         }
@@ -390,8 +432,7 @@ function renderRelated(relations) {
     }
 }
 
-// --- Episode rendering (Fix 3: download buttons) ---
-function renderEpisodes(episodes) {
+function renderEpisodes(episodes, watchedSet) {
     const container = $('#episode-list');
     container.innerHTML = '';
     if (!episodes.length) {
@@ -404,6 +445,9 @@ function renderEpisodes(episodes) {
 
         const btn = document.createElement('button');
         btn.className = 'episode-btn';
+        if (watchedSet && watchedSet.has(String(ep))) {
+            btn.classList.add('watched');
+        }
         btn.textContent = `Ep ${ep}`;
         btn.tabIndex = 0;
         btn.addEventListener('click', () => playEpisode(ep));
@@ -448,27 +492,47 @@ function normalizeSeriesTitle(title) {
         .trim();
 }
 
-// Fix 3: barrel download — download all episodes
 async function barrelDownload() {
     if (!currentAnime || !currentShowId || currentEpisodes.length === 0) return;
 
     const title = currentAnime.title_english || currentAnime.title_romaji || '';
     const barrel = determineBarrel();
     const total = currentEpisodes.length;
+    let queued = 0;
+    let skipped = 0;
+    let failed = 0;
 
-    $('#status-line').textContent = `[barrel download: ${total} episodes queuing...]`;
+    $('#status-line').textContent = `[barrel: queuing ${total} episodes...]`;
 
     for (let i = 0; i < currentEpisodes.length; i++) {
         const ep = currentEpisodes[i];
         try {
-            await downloadEpisode(ep, barrel);
+            const format = await invoke('start_download', {
+                showId: currentShowId,
+                animeId: currentAnime.id,
+                animeTitle: title,
+                episode: String(ep),
+                mode: 'sub',
+                barrel: barrel,
+                seriesTitle: normalizeSeriesTitle(title),
+            });
+            if (format === 'skipped') {
+                skipped++;
+            } else {
+                queued++;
+            }
         } catch (e) {
+            failed++;
             console.error(`Barrel download failed for ep ${ep}:`, e);
         }
-        $('#status-line').textContent = `[barrel: queued ${i + 1}/${total}]`;
+        $('#status-line').textContent = `[barrel: ${i + 1}/${total} processed]`;
     }
-    $('#status-line').textContent = `[barrel download: all ${total} episodes queued]`;
-    setTimeout(updateStatus, 3000);
+    const parts = [];
+    if (queued > 0) parts.push(`${queued} queued`);
+    if (skipped > 0) parts.push(`${skipped} skipped`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    $('#status-line').textContent = `[barrel done: ${parts.join(', ')}]`;
+    setTimeout(updateStatus, 4000);
 }
 
 // Wire barrel download button
@@ -550,6 +614,7 @@ async function loadMokuroku() {
 async function playEpisode(epNumber) {
     if (!currentShowId) return;
     setLoading(true);
+    currentEpisodeNumber = String(epNumber);
 
     const title = currentAnime?.title_english || currentAnime?.title_romaji || '';
 
@@ -630,6 +695,7 @@ function trySource(title, epNumber) {
     const video = $('#video-player');
     video.removeEventListener('error', video._onError);
     video.removeEventListener('stalled', video._onStalled);
+    video.removeEventListener('ended', video._onEnded);
 
     video._onError = () => {
         currentSourceIndex++;
@@ -645,6 +711,18 @@ function trySource(title, epNumber) {
         }, 10000);
     };
 
+    video._onEnded = () => {
+        const idx = currentEpisodes.indexOf(currentEpisodeNumber);
+        if (idx >= 0 && idx < currentEpisodes.length - 1) {
+            const nextEp = currentEpisodes[idx + 1];
+            $('#status-line').textContent = `[auto-playing ep ${nextEp}...]`;
+            playEpisode(nextEp);
+        } else {
+            $('#status-line').textContent = '[last episode finished]';
+            setTimeout(() => showView('detail'), 2000);
+        }
+    };
+
     video.addEventListener('error', video._onError);
     video.addEventListener('stalled', video._onStalled);
     video.addEventListener('playing', () => {
@@ -652,6 +730,7 @@ function trySource(title, epNumber) {
         $('#status-line').textContent = `[playing: ${source.provider} ${source.quality}]`;
         $('#status-line').classList.remove('warning');
     }, { once: true });
+    video.addEventListener('ended', video._onEnded, { once: true });
 
     video.src = source.url;
     video.play().catch(() => {
@@ -681,7 +760,6 @@ async function fallbackToMpv(title, epNumber) {
     }
 }
 
-// --- Downloads (Fix 4: barrel param, Fix 6: format warning) ---
 async function downloadEpisode(epNumber, barrel = '') {
     if (!currentAnime || !currentShowId) return;
     const title = currentAnime.title_english || currentAnime.title_romaji || '';
@@ -697,8 +775,11 @@ async function downloadEpisode(epNumber, barrel = '') {
             seriesTitle: seriesTitle,
         });
         if (format === 'skipped') {
-            $('#status-line').textContent = `[ep${epNumber}: already downloaded]`;
-            setTimeout(updateStatus, 2000);
+            // Don't spam status for barrel downloads
+            if (!barrel) {
+                $('#status-line').textContent = `[ep${epNumber}: already downloaded or in progress]`;
+                setTimeout(updateStatus, 2000);
+            }
         } else if (format === 'm3u8') {
             showWarning(`ep${epNumber}: m3u8 stream — download via yt-dlp/ffmpeg, no progress`);
         } else {
@@ -712,7 +793,6 @@ async function downloadEpisode(epNumber, barrel = '') {
     }
 }
 
-// Fix 5: hierarchical downloads view with auto-refresh
 async function loadDownloads() {
     showView('downloads');
     try {
@@ -727,6 +807,50 @@ async function loadDownloads() {
 function renderDownloadList(downloads) {
     const container = $('#download-list');
     container.innerHTML = '';
+
+    // Controls bar
+    const hasFailed = downloads.some(dl => dl.status === 'failed');
+    const hasComplete = downloads.some(dl => dl.status === 'complete');
+    if (hasFailed || hasComplete) {
+        const controls = document.createElement('div');
+        controls.className = 'download-controls';
+        if (hasFailed) {
+            const retryBtn = document.createElement('button');
+            retryBtn.className = 'barrel-btn';
+            retryBtn.textContent = 'retry failed';
+            retryBtn.addEventListener('click', async () => {
+                try {
+                    const count = await invoke('retry_failed_downloads');
+                    $('#status-line').textContent = `[retrying ${count} failed downloads]`;
+                    setTimeout(updateStatus, 3000);
+                    const dls = await invoke('get_downloads');
+                    renderDownloadList(dls);
+                } catch (e) {
+                    $('#status-line').textContent = `[retry error: ${e}]`;
+                    setTimeout(updateStatus, 3000);
+                }
+            });
+            controls.appendChild(retryBtn);
+        }
+        if (hasComplete) {
+            const clearBtn = document.createElement('button');
+            clearBtn.className = 'barrel-btn';
+            clearBtn.textContent = 'clear completed';
+            clearBtn.addEventListener('click', async () => {
+                try {
+                    await invoke('clear_completed_downloads');
+                    const dls = await invoke('get_downloads');
+                    renderDownloadList(dls);
+                } catch (e) {
+                    $('#status-line').textContent = `[clear error: ${e}]`;
+                    setTimeout(updateStatus, 3000);
+                }
+            });
+            controls.appendChild(clearBtn);
+        }
+        container.appendChild(controls);
+    }
+
     if (!downloads.length) {
         container.innerHTML = '<div class="empty-state">no downloads — press [dl] on an episode or [dl all] for a barrel</div>';
         return;
@@ -763,12 +887,13 @@ function renderDownloadList(downloads) {
                 const pct = Math.round(dl.progress * 100);
                 const statusColor = dl.status === 'complete' ? 'var(--green)' : dl.status === 'failed' ? 'var(--red)' : 'var(--text-dim)';
                 const epLabel = `Ep ${dl.episode}`;
+                const statusText = dl.status === 'downloading' ? `${pct}%` : dl.status;
                 item.innerHTML = `
                     <span class="download-title">${escapeHtml(epLabel)}</span>
                     <div class="download-progress">
                         <div class="download-progress-bar" style="width: ${pct}%"></div>
                     </div>
-                    <span class="download-status" style="color: ${statusColor}">${dl.status} ${dl.status === 'downloading' ? pct + '%' : ''}</span>
+                    <span class="download-status" style="color: ${statusColor}">${statusText}</span>
                 `;
                 container.appendChild(item);
             });
@@ -891,24 +1016,23 @@ async function loadSettings() {
     }
 }
 
-// Simple 18+ confirmation for adult content toggle
 async function toggleAdult() {
-    const settings = await invoke('get_settings');
-    const isAdult = settings.allow_adult === 'true';
-    if (isAdult) {
-        // Disabling — no confirmation needed
-        try {
+    try {
+        const settings = await invoke('get_settings');
+        const isAdult = settings.allow_adult === 'true';
+        if (isAdult) {
+            // Disabling — no confirmation needed
             await invoke('toggle_adult_content');
             $('#status-line').textContent = '[adult content: disabled]';
-            loadSettings();
-            loadHome();
-        } catch (e) {
-            $('#status-line').textContent = `[error: ${e}]`;
-            setTimeout(updateStatus, 3000);
+            setTimeout(updateStatus, 2000);
+            refreshSettingsView();
+        } else {
+            // Enabling — show 18+ confirmation
+            showAdultModal();
         }
-    } else {
-        // Enabling — show 18+ confirmation
-        showAdultModal();
+    } catch (e) {
+        $('#status-line').textContent = `[error: ${e}]`;
+        setTimeout(updateStatus, 3000);
     }
 }
 
@@ -927,12 +1051,61 @@ async function confirmAdultContent() {
     try {
         const result = await invoke('toggle_adult_content');
         $('#status-line').textContent = `[adult content: ${result ? 'enabled' : 'disabled'}]`;
-        loadSettings();
-        loadHome();
+        setTimeout(updateStatus, 2000);
+        refreshSettingsView();
     } catch (e) {
         $('#status-line').textContent = `[error: ${e}]`;
         setTimeout(updateStatus, 3000);
     }
+}
+
+// Refresh settings UI without switching views
+async function refreshSettingsView() {
+    try {
+        const settings = await invoke('get_settings');
+        const container = $('#settings-list');
+        container.innerHTML = '';
+        const adultItem = document.createElement('div');
+        adultItem.className = 'settings-item';
+        adultItem.tabIndex = 0;
+        const isAdult = settings.allow_adult === 'true';
+        adultItem.innerHTML = `
+            <span class="settings-label">adult content</span>
+            <span class="settings-value ${isAdult ? 'enabled' : ''}">${isAdult ? 'enabled' : 'disabled'}</span>
+            <span class="settings-hint">[Enter] toggle</span>
+        `;
+        adultItem.addEventListener('click', toggleAdult);
+        adultItem.addEventListener('keydown', (e) => { if (e.key === 'Enter') toggleAdult(); });
+        container.appendChild(adultItem);
+    } catch {}
+}
+
+// --- Disclaimer modal ---
+async function checkDisclaimer() {
+    try {
+        const settings = await invoke('get_settings');
+        if (settings.disclaimer_accepted !== 'true') {
+            disclaimerVisible = true;
+            $('#disclaimer-modal').classList.remove('hidden');
+        }
+    } catch {
+        disclaimerVisible = true;
+        $('#disclaimer-modal').classList.remove('hidden');
+    }
+}
+
+async function acceptDisclaimer() {
+    disclaimerVisible = false;
+    $('#disclaimer-modal').classList.add('hidden');
+    try {
+        await invoke('set_setting', { key: 'disclaimer_accepted', value: 'true' });
+    } catch (e) {
+        console.error('Failed to save disclaimer acceptance:', e);
+    }
+}
+
+function declineDisclaimer() {
+    invoke('quit_app').catch(() => window.close());
 }
 
 // --- Quit modal ---
@@ -948,6 +1121,17 @@ function hideQuitModal() {
 
 // --- Keyboard navigation ---
 document.addEventListener('keydown', (e) => {
+    // Disclaimer modal takes highest priority
+    if (disclaimerVisible) {
+        if (e.key === 'y' || e.key === 'Y') {
+            acceptDisclaimer();
+        } else if (e.key === 'n' || e.key === 'N') {
+            declineDisclaimer();
+        }
+        e.preventDefault();
+        return;
+    }
+
     // Adult confirmation modal takes priority
     if (adultModalVisible) {
         if (e.key === 'y' || e.key === 'Y') {
@@ -1030,5 +1214,6 @@ function escapeHtml(text) {
 }
 
 // --- Init ---
+checkDisclaimer();
 loadHome();
 updateStatus();

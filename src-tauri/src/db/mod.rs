@@ -117,6 +117,28 @@ impl Database {
         Ok(())
     }
 
+    // --- Cache ---
+
+    pub fn get_cache(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn
+            .prepare("SELECT value FROM cache WHERE key = ?1 AND expires_at > datetime('now')")?
+            .query_row(rusqlite::params![key], |row| row.get::<_, String>(0))
+            .ok();
+        Ok(result)
+    }
+
+    pub fn set_cache(&self, key: &str, value: &str, ttl_seconds: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?1, ?2, datetime('now', '+' || ?3 || ' seconds'))",
+            rusqlite::params![key, value, ttl_seconds],
+        )?;
+        // Opportunistic cleanup
+        conn.execute("DELETE FROM cache WHERE expires_at <= datetime('now')", []).ok();
+        Ok(())
+    }
+
     // --- Watch History ---
 
     pub fn add_to_history(&self, anime_id: i64, title: &str, episode: &str) -> Result<()> {
@@ -148,9 +170,40 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn get_continue_watching(&self, limit: i32) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT w.anime_id, w.title, w.episode, w.watched_at
+             FROM watch_history w
+             INNER JOIN (SELECT anime_id, MAX(watched_at) AS max_at FROM watch_history GROUP BY anime_id) latest
+             ON w.anime_id = latest.anime_id AND w.watched_at = latest.max_at
+             ORDER BY w.watched_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_watched_episodes(&self, anime_id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT episode FROM watch_history WHERE anime_id = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![anime_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // --- Downloads ---
 
-    /// Returns Some(download_id) if queued, None if already complete
+    /// Returns Some(download_id) if queued, None if already complete or in-progress
     pub fn queue_download(
         &self,
         anime_id: i64,
@@ -168,13 +221,20 @@ impl Database {
             .ok();
 
         if let Some((id, status, file_path)) = existing {
+            // Skip if currently downloading or queued
+            if status == "downloading" || status == "queued" {
+                return Ok(None);
+            }
+            // Skip if complete and file exists with non-zero size
             if status == "complete" {
                 if let Some(ref fp) = file_path {
-                    if std::path::Path::new(fp).exists() {
+                    let path = std::path::Path::new(fp);
+                    if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                         return Ok(None);
                     }
                 }
             }
+            // Failed, or complete with missing/empty file — reset and retry
             conn.execute(
                 "UPDATE downloads SET title = ?1, barrel = ?2, series_title = ?3, status = 'queued', progress = 0.0, file_path = NULL WHERE id = ?4",
                 rusqlite::params![title, barrel, series_title, id],
@@ -194,7 +254,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, anime_id, title, episode, barrel, series_title, file_path, status, progress
-             FROM downloads ORDER BY series_title, barrel, episode",
+             FROM downloads ORDER BY series_title, barrel, CAST(episode AS REAL), episode",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -238,6 +298,30 @@ impl Database {
             "UPDATE downloads SET status = 'failed' WHERE id = ?1",
             rusqlite::params![id],
         )?;
+        Ok(())
+    }
+
+    /// Reset all failed downloads to 'queued' for retry
+    pub fn retry_failed_downloads(&self) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE downloads SET status = 'queued', progress = 0.0, file_path = NULL WHERE status = 'failed'",
+            [],
+        )?;
+        Ok(count as i32)
+    }
+
+    /// Delete a download entry
+    pub fn delete_download(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM downloads WHERE id = ?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// Clear all completed downloads from the list
+    pub fn clear_completed_downloads(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM downloads WHERE status = 'complete'", [])?;
         Ok(())
     }
 
