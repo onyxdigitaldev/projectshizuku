@@ -477,16 +477,33 @@ async fn retry_failed_downloads(
         let downloads = state.db.get_downloads().map_err(|e| e.to_string())?;
         let queued: Vec<_> = downloads.into_iter().filter(|d| d.status == "queued").collect();
         for dl in queued {
-            if dl.show_id.is_empty() {
-                // Legacy entries without show_id can't be retried automatically
-                let _ = state.db.update_download_failed(dl.id);
-                continue;
-            }
+            let show_id = if dl.show_id.is_empty() {
+                // Legacy entry — resolve show_id by searching AllAnime
+                let search_title = if !dl.series_title.is_empty() {
+                    dl.series_title.clone()
+                } else {
+                    // Extract anime title from "Title - Episode X" format
+                    dl.title.split(" - Episode ").next().unwrap_or(&dl.title).to_string()
+                };
+                match state.allanime.search(&search_title, "sub").await {
+                    Ok(results) if !results.is_empty() => {
+                        let resolved = results[0].id.clone();
+                        let _ = state.db.update_download_show_id(dl.id, &resolved);
+                        resolved
+                    }
+                    _ => {
+                        let _ = state.db.update_download_failed(dl.id);
+                        continue;
+                    }
+                }
+            } else {
+                dl.show_id.clone()
+            };
             spawn_download(
                 app_handle.clone(),
                 state.inner().clone(),
                 dl.id,
-                dl.show_id.clone(),
+                show_id,
                 dl.anime_id,
                 dl.title.clone(),
                 dl.episode.clone(),

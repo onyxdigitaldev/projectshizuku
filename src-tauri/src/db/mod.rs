@@ -301,6 +301,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_download_show_id(&self, id: i64, show_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE downloads SET show_id = ?1 WHERE id = ?2",
+            rusqlite::params![show_id, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_download_failed(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
