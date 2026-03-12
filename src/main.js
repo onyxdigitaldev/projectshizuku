@@ -15,7 +15,7 @@ let genrePage = 1;
 let genreLoading = false;
 let genreHasMore = true;
 let downloadRefreshInterval = null;
-let passwordCallback = null;
+let adultModalVisible = false;
 
 const GENRES = [
     'Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror',
@@ -436,6 +436,18 @@ function determineBarrel() {
     return 'Season 1';
 }
 
+// Normalize series title — strip season/part indicators so all seasons share one folder
+function normalizeSeriesTitle(title) {
+    if (!title) return '';
+    return title
+        .replace(/\s*[\-:]\s*(Season|Part|Cour)\s*\d+.*$/i, '')
+        .replace(/\s*(Season|Part|Cour)\s*\d+.*$/i, '')
+        .replace(/\s*(2nd|3rd|4th|5th|6th|7th|8th|9th|10th)\s*Season.*$/i, '')
+        .replace(/\s*(II|III|IV|V|VI|VII|VIII|IX|X)\s*$/i, '')
+        .replace(/\s+\d+\s*$/, '')
+        .trim();
+}
+
 // Fix 3: barrel download — download all episodes
 async function barrelDownload() {
     if (!currentAnime || !currentShowId || currentEpisodes.length === 0) return;
@@ -673,6 +685,7 @@ async function fallbackToMpv(title, epNumber) {
 async function downloadEpisode(epNumber, barrel = '') {
     if (!currentAnime || !currentShowId) return;
     const title = currentAnime.title_english || currentAnime.title_romaji || '';
+    const seriesTitle = normalizeSeriesTitle(title);
     try {
         const format = await invoke('start_download', {
             showId: currentShowId,
@@ -681,8 +694,12 @@ async function downloadEpisode(epNumber, barrel = '') {
             episode: String(epNumber),
             mode: 'sub',
             barrel: barrel,
+            seriesTitle: seriesTitle,
         });
-        if (format === 'm3u8') {
+        if (format === 'skipped') {
+            $('#status-line').textContent = `[ep${epNumber}: already downloaded]`;
+            setTimeout(updateStatus, 2000);
+        } else if (format === 'm3u8') {
             showWarning(`ep${epNumber}: m3u8 stream — download via yt-dlp/ffmpeg, no progress`);
         } else {
             $('#status-line').textContent = `[downloading: ${title} ep${epNumber}]`;
@@ -715,17 +732,17 @@ function renderDownloadList(downloads) {
         return;
     }
 
-    // Group by anime_id, then by barrel
+    // Group by series_title, then by barrel
     const groups = {};
     downloads.forEach(dl => {
-        const key = dl.anime_id;
-        if (!groups[key]) groups[key] = { title: dl.title.split(' - ')[0], barrels: {} };
+        const key = dl.series_title || dl.title.split(' - ')[0];
+        if (!groups[key]) groups[key] = { title: key, barrels: {} };
         const barrelKey = dl.barrel || '';
         if (!groups[key].barrels[barrelKey]) groups[key].barrels[barrelKey] = [];
         groups[key].barrels[barrelKey].push(dl);
     });
 
-    Object.entries(groups).forEach(([animeId, group]) => {
+    Object.entries(groups).forEach(([seriesName, group]) => {
         const seriesHeader = document.createElement('div');
         seriesHeader.className = 'download-series-header';
         seriesHeader.textContent = group.title;
@@ -864,7 +881,7 @@ async function loadSettings() {
         adultItem.innerHTML = `
             <span class="settings-label">adult content</span>
             <span class="settings-value ${isAdult ? 'enabled' : ''}">${isAdult ? 'enabled' : 'disabled'}</span>
-            <span class="settings-hint">[Enter] toggle (requires password)</span>
+            <span class="settings-hint">[Enter] toggle</span>
         `;
         adultItem.addEventListener('click', toggleAdult);
         adultItem.addEventListener('keydown', (e) => { if (e.key === 'Enter') toggleAdult(); });
@@ -874,66 +891,48 @@ async function loadSettings() {
     }
 }
 
-// Fix 7: in-app password auth instead of pkexec
+// Simple 18+ confirmation for adult content toggle
 async function toggleAdult() {
-    try {
-        const hasPassword = await invoke('has_adult_password');
-        if (!hasPassword) {
-            showPasswordModal('set adult content password', true, async (pw) => {
-                try {
-                    await invoke('set_adult_password', { password: pw });
-                    const result = await invoke('toggle_adult_content', { password: pw });
-                    $('#status-line').textContent = `[adult content: ${result ? 'enabled' : 'disabled'}]`;
-                    hidePasswordModal();
-                    loadSettings();
-                    loadHome();
-                } catch (e) {
-                    showPasswordError(String(e));
-                }
-            });
-        } else {
-            showPasswordModal('enter password to toggle adult content', false, async (pw) => {
-                try {
-                    const result = await invoke('toggle_adult_content', { password: pw });
-                    $('#status-line').textContent = `[adult content: ${result ? 'enabled' : 'disabled'}]`;
-                    hidePasswordModal();
-                    loadSettings();
-                    loadHome();
-                } catch (e) {
-                    if (String(e).includes('incorrect')) {
-                        showPasswordError('incorrect password');
-                    } else {
-                        showPasswordError(String(e));
-                    }
-                }
-            });
+    const settings = await invoke('get_settings');
+    const isAdult = settings.allow_adult === 'true';
+    if (isAdult) {
+        // Disabling — no confirmation needed
+        try {
+            await invoke('toggle_adult_content');
+            $('#status-line').textContent = '[adult content: disabled]';
+            loadSettings();
+            loadHome();
+        } catch (e) {
+            $('#status-line').textContent = `[error: ${e}]`;
+            setTimeout(updateStatus, 3000);
         }
+    } else {
+        // Enabling — show 18+ confirmation
+        showAdultModal();
+    }
+}
+
+function showAdultModal() {
+    adultModalVisible = true;
+    $('#adult-modal').classList.remove('hidden');
+}
+
+function hideAdultModal() {
+    adultModalVisible = false;
+    $('#adult-modal').classList.add('hidden');
+}
+
+async function confirmAdultContent() {
+    hideAdultModal();
+    try {
+        const result = await invoke('toggle_adult_content');
+        $('#status-line').textContent = `[adult content: ${result ? 'enabled' : 'disabled'}]`;
+        loadSettings();
+        loadHome();
     } catch (e) {
         $('#status-line').textContent = `[error: ${e}]`;
         setTimeout(updateStatus, 3000);
     }
-}
-
-// --- Password modal ---
-function showPasswordModal(title, needConfirm, callback) {
-    passwordCallback = callback;
-    $('#password-modal-title').textContent = title;
-    $('#password-input').value = '';
-    $('#password-confirm').value = '';
-    $('#password-modal-error').classList.add('hidden');
-    $('#password-modal-confirm-row').classList.toggle('hidden', !needConfirm);
-    $('#password-modal').classList.remove('hidden');
-    $('#password-input').focus();
-}
-
-function hidePasswordModal() {
-    passwordCallback = null;
-    $('#password-modal').classList.add('hidden');
-}
-
-function showPasswordError(msg) {
-    $('#password-modal-error').textContent = msg;
-    $('#password-modal-error').classList.remove('hidden');
 }
 
 // --- Quit modal ---
@@ -949,19 +948,12 @@ function hideQuitModal() {
 
 // --- Keyboard navigation ---
 document.addEventListener('keydown', (e) => {
-    // Password modal takes priority
-    if (!$('#password-modal').classList.contains('hidden')) {
-        if (e.key === 'Escape') {
-            hidePasswordModal();
-        } else if (e.key === 'Enter') {
-            const pw = $('#password-input').value;
-            const confirm = $('#password-confirm').value;
-            if (!$('#password-modal-confirm-row').classList.contains('hidden')) {
-                if (pw !== confirm) { showPasswordError('passwords do not match'); e.preventDefault(); return; }
-                if (pw.length < 4) { showPasswordError('password too short (min 4 chars)'); e.preventDefault(); return; }
-            }
-            if (!pw) { showPasswordError('password required'); e.preventDefault(); return; }
-            if (passwordCallback) passwordCallback(pw);
+    // Adult confirmation modal takes priority
+    if (adultModalVisible) {
+        if (e.key === 'y' || e.key === 'Y') {
+            confirmAdultContent();
+        } else {
+            hideAdultModal();
         }
         e.preventDefault();
         return;
@@ -984,11 +976,6 @@ document.addEventListener('keydown', (e) => {
             showQuitModal();
             e.preventDefault();
         }
-        return;
-    }
-
-    // Don't capture when in password fields
-    if (document.activeElement === $('#password-input') || document.activeElement === $('#password-confirm')) {
         return;
     }
 

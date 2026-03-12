@@ -11,6 +11,7 @@ pub struct DownloadEntry {
     pub title: String,
     pub episode: String,
     pub barrel: String,
+    pub series_title: String,
     pub file_path: Option<String>,
     pub status: String,
     pub progress: f64,
@@ -59,6 +60,7 @@ impl Database {
                 title TEXT NOT NULL,
                 episode TEXT NOT NULL,
                 barrel TEXT NOT NULL DEFAULT '',
+                series_title TEXT NOT NULL DEFAULT '',
                 file_path TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 progress REAL NOT NULL DEFAULT 0.0,
@@ -89,10 +91,9 @@ impl Database {
             INSERT OR IGNORE INTO settings (key, value) VALUES ('download_dir', '~/Shizuku');
             ",
         )?;
-        // Migration: add barrel column for existing databases
-        conn.execute_batch(
-            "ALTER TABLE downloads ADD COLUMN barrel TEXT NOT NULL DEFAULT '';"
-        ).ok();
+        // Migrations for existing databases
+        conn.execute_batch("ALTER TABLE downloads ADD COLUMN barrel TEXT NOT NULL DEFAULT '';").ok();
+        conn.execute_batch("ALTER TABLE downloads ADD COLUMN series_title TEXT NOT NULL DEFAULT '';").ok();
         Ok(())
     }
 
@@ -149,27 +150,51 @@ impl Database {
 
     // --- Downloads ---
 
+    /// Returns Some(download_id) if queued, None if already complete
     pub fn queue_download(
         &self,
         anime_id: i64,
         title: &str,
         episode: &str,
         barrel: &str,
-    ) -> Result<i64> {
+        series_title: &str,
+    ) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
+        let existing: Option<(i64, String, Option<String>)> = conn
+            .prepare("SELECT id, status, file_path FROM downloads WHERE anime_id = ?1 AND episode = ?2")?
+            .query_row(rusqlite::params![anime_id, episode], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .ok();
+
+        if let Some((id, status, file_path)) = existing {
+            if status == "complete" {
+                if let Some(ref fp) = file_path {
+                    if std::path::Path::new(fp).exists() {
+                        return Ok(None);
+                    }
+                }
+            }
+            conn.execute(
+                "UPDATE downloads SET title = ?1, barrel = ?2, series_title = ?3, status = 'queued', progress = 0.0, file_path = NULL WHERE id = ?4",
+                rusqlite::params![title, barrel, series_title, id],
+            )?;
+            return Ok(Some(id));
+        }
+
         conn.execute(
-            "INSERT OR REPLACE INTO downloads (anime_id, title, episode, barrel, status, progress)
-             VALUES (?1, ?2, ?3, ?4, 'queued', 0.0)",
-            rusqlite::params![anime_id, title, episode, barrel],
+            "INSERT INTO downloads (anime_id, title, episode, barrel, series_title, status, progress)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 0.0)",
+            rusqlite::params![anime_id, title, episode, barrel, series_title],
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok(Some(conn.last_insert_rowid()))
     }
 
     pub fn get_downloads(&self) -> Result<Vec<DownloadEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, anime_id, title, episode, barrel, file_path, status, progress
-             FROM downloads ORDER BY created_at DESC",
+            "SELECT id, anime_id, title, episode, barrel, series_title, file_path, status, progress
+             FROM downloads ORDER BY series_title, barrel, episode",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -179,9 +204,10 @@ impl Database {
                     title: row.get(2)?,
                     episode: row.get(3)?,
                     barrel: row.get(4)?,
-                    file_path: row.get(5)?,
-                    status: row.get(6)?,
-                    progress: row.get(7)?,
+                    series_title: row.get(5)?,
+                    file_path: row.get(6)?,
+                    status: row.get(7)?,
+                    progress: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

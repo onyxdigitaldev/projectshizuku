@@ -792,8 +792,8 @@ body::after {
     font-weight: 500;
 }
 
-/* Password modal */
-#password-modal {
+/* Adult content modal */
+#adult-modal {
     position: fixed;
     top: 0;
     left: 0;
@@ -804,27 +804,4 @@ body::after {
     display: flex;
     align-items: center;
     justify-content: center;
-}
-
-.password-field {
-    width: 100%;
-    padding: 8px 12px;
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    color: var(--text-bright);
-    font-family: inherit;
-    font-size: 13px;
-    outline: none;
-    margin-top: 12px;
-}
-
-.password-field:focus {
-    border-color: var(--accent);
-}
-
-.modal-error {
-    color: var(--red);
-    font-size: 11px;
-    margin-top: 8px;
 }

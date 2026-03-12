@@ -213,6 +213,7 @@ async fn start_download(
     episode: String,
     mode: String,
     barrel: String,
+    series_title: String,
 ) -> Result<String, String> {
     let sources = state
         .allanime
@@ -232,8 +233,10 @@ async fn start_download(
         .ok_or("No source found")?;
 
     // Create download directory with barrel subfolder
+    // Use series_title for folder (groups all seasons together)
     let download_dir = state.download_dir();
-    let safe_title = anime_title
+    let folder_name = if series_title.is_empty() { &anime_title } else { &series_title };
+    let safe_title = folder_name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
         .collect::<String>();
@@ -249,15 +252,20 @@ async fn start_download(
     let file_path = target_dir.join(&file_name);
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let download_id = state
+    let download_id = match state
         .db
         .queue_download(
             anime_id,
             &format!("{} - Episode {}", anime_title, episode),
             &episode,
             &barrel,
+            &series_title,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    {
+        Some(id) => id,
+        None => return Ok("skipped".to_string()), // already complete
+    };
 
     let is_m3u8 = source.url.contains("m3u8");
 
@@ -447,53 +455,11 @@ async fn get_settings(
     Ok(settings)
 }
 
-// Fix 7: password-based auth instead of pkexec
-#[tauri::command]
-async fn has_adult_password(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<bool, String> {
-    let hash = state
-        .db
-        .get_setting("adult_password_hash")
-        .map_err(|e| e.to_string())?;
-    Ok(hash.is_some())
-}
-
-#[tauri::command]
-async fn set_adult_password(
-    state: tauri::State<'_, Arc<AppState>>,
-    password: String,
-) -> Result<(), String> {
-    use sha2::{Sha256, Digest};
-    let hash = format!("{:x}", Sha256::digest(password.as_bytes()));
-    state
-        .db
-        .set_setting("adult_password_hash", &hash)
-        .map_err(|e| e.to_string())
-}
-
+// Simple adult content toggle — no auth, just confirmation from frontend
 #[tauri::command]
 async fn toggle_adult_content(
     state: tauri::State<'_, Arc<AppState>>,
-    password: String,
 ) -> Result<bool, String> {
-    use sha2::{Sha256, Digest};
-
-    let stored_hash = state
-        .db
-        .get_setting("adult_password_hash")
-        .map_err(|e| e.to_string())?;
-
-    match stored_hash {
-        None => return Err("no_password_set".to_string()),
-        Some(hash) => {
-            let input_hash = format!("{:x}", Sha256::digest(password.as_bytes()));
-            if input_hash != hash {
-                return Err("incorrect_password".to_string());
-            }
-        }
-    }
-
     let current = state.allow_adult();
     let new_value = if current { "false" } else { "true" };
     state
@@ -573,8 +539,6 @@ pub fn run() {
             get_mokuroku,
             is_in_mokuroku,
             get_settings,
-            has_adult_password,
-            set_adult_password,
             toggle_adult_content,
             play_in_mpv,
             quit_app,
