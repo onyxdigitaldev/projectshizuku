@@ -94,6 +94,11 @@ impl Database {
         // Migrations for existing databases
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN barrel TEXT NOT NULL DEFAULT '';").ok();
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN series_title TEXT NOT NULL DEFAULT '';").ok();
+        // Reset stale downloads — if app just started, nothing can be actively downloading
+        conn.execute(
+            "UPDATE downloads SET status = 'failed' WHERE status = 'downloading' OR status = 'queued'",
+            [],
+        ).ok();
         Ok(())
     }
 
