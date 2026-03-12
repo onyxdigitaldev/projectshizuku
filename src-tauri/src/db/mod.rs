@@ -12,6 +12,7 @@ pub struct DownloadEntry {
     pub episode: String,
     pub barrel: String,
     pub series_title: String,
+    pub show_id: String,
     pub file_path: Option<String>,
     pub status: String,
     pub progress: f64,
@@ -94,6 +95,7 @@ impl Database {
         // Migrations for existing databases
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN barrel TEXT NOT NULL DEFAULT '';").ok();
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN series_title TEXT NOT NULL DEFAULT '';").ok();
+        conn.execute_batch("ALTER TABLE downloads ADD COLUMN show_id TEXT NOT NULL DEFAULT '';").ok();
         // Reset stale downloads — if app just started, nothing can be actively downloading
         conn.execute(
             "UPDATE downloads SET status = 'failed' WHERE status = 'downloading' OR status = 'queued'",
@@ -216,6 +218,7 @@ impl Database {
         episode: &str,
         barrel: &str,
         series_title: &str,
+        show_id: &str,
     ) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<(i64, String, Option<String>)> = conn
@@ -241,16 +244,16 @@ impl Database {
             }
             // Failed, or complete with missing/empty file — reset and retry
             conn.execute(
-                "UPDATE downloads SET title = ?1, barrel = ?2, series_title = ?3, status = 'queued', progress = 0.0, file_path = NULL WHERE id = ?4",
-                rusqlite::params![title, barrel, series_title, id],
+                "UPDATE downloads SET title = ?1, barrel = ?2, series_title = ?3, show_id = ?4, status = 'queued', progress = 0.0, file_path = NULL WHERE id = ?5",
+                rusqlite::params![title, barrel, series_title, show_id, id],
             )?;
             return Ok(Some(id));
         }
 
         conn.execute(
-            "INSERT INTO downloads (anime_id, title, episode, barrel, series_title, status, progress)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 0.0)",
-            rusqlite::params![anime_id, title, episode, barrel, series_title],
+            "INSERT INTO downloads (anime_id, title, episode, barrel, series_title, show_id, status, progress)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', 0.0)",
+            rusqlite::params![anime_id, title, episode, barrel, series_title, show_id],
         )?;
         Ok(Some(conn.last_insert_rowid()))
     }
@@ -258,7 +261,7 @@ impl Database {
     pub fn get_downloads(&self) -> Result<Vec<DownloadEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, anime_id, title, episode, barrel, series_title, file_path, status, progress
+            "SELECT id, anime_id, title, episode, barrel, series_title, show_id, file_path, status, progress
              FROM downloads ORDER BY series_title, barrel, CAST(episode AS REAL), episode",
         )?;
         let rows = stmt
@@ -270,9 +273,10 @@ impl Database {
                     episode: row.get(3)?,
                     barrel: row.get(4)?,
                     series_title: row.get(5)?,
-                    file_path: row.get(6)?,
-                    status: row.get(7)?,
-                    progress: row.get(8)?,
+                    show_id: row.get(6)?,
+                    file_path: row.get(7)?,
+                    status: row.get(8)?,
+                    progress: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

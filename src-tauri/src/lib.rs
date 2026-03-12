@@ -263,6 +263,7 @@ async fn start_download(
             &episode,
             &barrel,
             &series_title,
+            &show_id,
         )
         .map_err(|e| e.to_string())?
     {
@@ -472,15 +473,141 @@ async fn retry_failed_downloads(
 ) -> Result<i32, String> {
     let count = state.db.retry_failed_downloads().map_err(|e| e.to_string())?;
 
-    // Re-queue the retried downloads for actual download
     if count > 0 {
         let downloads = state.db.get_downloads().map_err(|e| e.to_string())?;
-        for dl in downloads.iter().filter(|d| d.status == "queued") {
-            let _ = app_handle.emit("download-retry", serde_json::json!({ "id": dl.id }));
+        let queued: Vec<_> = downloads.into_iter().filter(|d| d.status == "queued").collect();
+        for dl in queued {
+            if dl.show_id.is_empty() {
+                // Legacy entries without show_id can't be retried automatically
+                let _ = state.db.update_download_failed(dl.id);
+                continue;
+            }
+            spawn_download(
+                app_handle.clone(),
+                state.inner().clone(),
+                dl.id,
+                dl.show_id.clone(),
+                dl.anime_id,
+                dl.title.clone(),
+                dl.episode.clone(),
+                dl.barrel.clone(),
+                dl.series_title.clone(),
+            );
         }
     }
 
     Ok(count)
+}
+
+/// Shared download spawner — used by start_download and retry_failed_downloads
+fn spawn_download(
+    app_handle: tauri::AppHandle,
+    state: Arc<AppState>,
+    download_id: i64,
+    show_id: String,
+    _anime_id: i64,
+    title: String,
+    episode: String,
+    barrel: String,
+    series_title: String,
+) {
+    let sem = state.download_semaphore.clone();
+
+    tokio::spawn(async move {
+        let _permit = sem.acquire().await.unwrap();
+
+        // Fetch sources
+        let sources = match state.allanime.get_episode_sources(&show_id, &episode, "sub").await {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                let _ = state.db.update_download_failed(download_id);
+                let _ = app_handle.emit("download-failed", serde_json::json!({ "id": download_id }));
+                return;
+            }
+            Err(_) => {
+                let _ = state.db.update_download_failed(download_id);
+                let _ = app_handle.emit("download-failed", serde_json::json!({ "id": download_id }));
+                return;
+            }
+        };
+
+        let source = sources
+            .iter()
+            .find(|s| s.url.contains(".mp4"))
+            .or(sources.first())
+            .cloned()
+            .unwrap();
+
+        // Build file path
+        let download_dir = state.download_dir();
+        let folder_name = if series_title.is_empty() { &title } else { &series_title };
+        let safe_title = folder_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
+            .collect::<String>();
+        let anime_dir = download_dir.join(&safe_title);
+        let target_dir = if barrel.is_empty() {
+            anime_dir
+        } else {
+            anime_dir.join(&barrel)
+        };
+        if let Err(_) = std::fs::create_dir_all(&target_dir) {
+            let _ = state.db.update_download_failed(download_id);
+            let _ = app_handle.emit("download-failed", serde_json::json!({ "id": download_id }));
+            return;
+        }
+
+        let file_name = format!("Episode_{}.mp4", episode);
+        let fp = target_dir.join(&file_name).to_string_lossy().to_string();
+
+        let is_m3u8 = source.url.contains("m3u8");
+
+        if is_m3u8 {
+            let status = if command_exists("yt-dlp") {
+                tokio::process::Command::new("yt-dlp")
+                    .arg(&source.url)
+                    .arg("--no-skip-unavailable-fragments")
+                    .arg("-N").arg("16")
+                    .arg("-o").arg(&fp)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+            } else {
+                tokio::process::Command::new("ffmpeg")
+                    .arg("-i").arg(&source.url)
+                    .arg("-c").arg("copy")
+                    .arg("-loglevel").arg("error")
+                    .arg(&fp)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+            };
+
+            match status {
+                Ok(s) if s.success() => {
+                    let _ = state.db.update_download_complete(download_id, &fp);
+                    let _ = app_handle.emit("download-complete", serde_json::json!({ "id": download_id, "file_path": fp }));
+                }
+                _ => {
+                    let _ = state.db.update_download_failed(download_id);
+                    let _ = app_handle.emit("download-failed", serde_json::json!({ "id": download_id }));
+                }
+            }
+        } else {
+            match download_file(&source.url, &fp, download_id, &app_handle, &state).await {
+                Ok(()) => {
+                    let _ = state.db.update_download_complete(download_id, &fp);
+                    let _ = app_handle.emit("download-complete", serde_json::json!({ "id": download_id, "file_path": fp }));
+                }
+                Err(_) => {
+                    let _ = state.db.update_download_failed(download_id);
+                    let _ = app_handle.emit("download-failed", serde_json::json!({ "id": download_id }));
+                }
+            }
+        }
+    });
 }
 
 #[tauri::command]
