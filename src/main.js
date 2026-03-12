@@ -18,6 +18,7 @@ let downloadRefreshInterval = null;
 let adultModalVisible = false;
 let disclaimerVisible = false;
 let currentEpisodeNumber = null;
+let currentSeasonInfo = null;
 
 const GENRES = [
     'Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror',
@@ -51,7 +52,6 @@ function showView(name) {
     updateStatus();
 }
 
-// Fix 1: remove error/stalled listeners before clearing video src
 function goBack() {
     if (currentView === 'player') {
         const video = $('#video-player');
@@ -92,7 +92,6 @@ function setLoading(on) {
     $('#loading').classList.toggle('hidden', !on);
 }
 
-// Fix 6: warning helper
 function showWarning(msg) {
     const el = $('#status-line');
     el.textContent = `[warn: ${msg}]`;
@@ -196,7 +195,6 @@ function renderContinueWatching(list) {
     });
 }
 
-// --- Genre browsing (Fix 2: pagination) ---
 function initGenrePills() {
     const container = $('#genre-pills');
     container.innerHTML = '';
@@ -244,6 +242,12 @@ async function loadGenrePage(genre, page) {
     }
     genreLoading = false;
     setLoading(false);
+    // If content doesn't overflow yet, keep loading
+    const app = $('#app');
+    if (genreHasMore && app.scrollHeight <= app.clientHeight) {
+        genrePage++;
+        await loadGenrePage(genre, genrePage);
+    }
 }
 
 // Infinite scroll for genre browsing
@@ -304,6 +308,41 @@ $('#search-input').addEventListener('keydown', (e) => {
 });
 
 // --- Detail view ---
+function pickBestProvider(results, title, expectedEpisodes) {
+    const normalize = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const target = normalize(title);
+
+    let best = results[0];
+    let bestScore = -1;
+
+    for (const r of results) {
+        let score = 0;
+        const name = normalize(r.name);
+
+        // Exact match
+        if (name === target) score += 100;
+        // Name contains target or vice versa
+        else if (name.includes(target) || target.includes(name)) score += 50;
+        // Partial word overlap
+        else {
+            const targetWords = target.match(/.{3,}/g) || [];
+            const matchCount = targetWords.filter(w => name.includes(w)).length;
+            score += matchCount * 10;
+        }
+
+        // Episode count match (strong signal when available)
+        if (expectedEpisodes && r.sub_count === expectedEpisodes) score += 80;
+        // Close episode count
+        else if (expectedEpisodes && r.sub_count && Math.abs(r.sub_count - expectedEpisodes) <= 2) score += 40;
+
+        if (score > bestScore) {
+            bestScore = score;
+            best = r;
+        }
+    }
+    return best;
+}
+
 async function openAnimeDetail(anime) {
     currentAnime = anime;
     showView('detail');
@@ -334,11 +373,13 @@ async function openAnimeDetail(anime) {
     updateMokurokuBadge(anime.id);
 
     renderRelated([]);
+    currentSeasonInfo = null;
     try {
         const fullAnime = await invoke('get_anime_detail', { id: anime.id });
         if (fullAnime.relations && fullAnime.relations.length > 0) {
             renderRelated(fullAnime.relations);
         }
+        currentSeasonInfo = await invoke('resolve_season_number', { id: anime.id });
     } catch (e) {
         console.error('Failed to fetch relations:', e);
     }
@@ -346,12 +387,13 @@ async function openAnimeDetail(anime) {
     $('#episode-list').innerHTML = '<div class="empty-state">loading episodes...</div>';
     try {
         const [providerResults, watchedEps] = await Promise.all([
-            invoke('provider_search', { query: romaji || title, mode: 'sub' }),
+            invoke('provider_search', { query: title, mode: 'sub' }),
             invoke('get_watched_episodes', { animeId: anime.id }).catch(() => []),
         ]);
         const watchedSet = new Set(watchedEps);
         if (providerResults.length > 0) {
-            currentShowId = providerResults[0].id;
+            const bestMatch = pickBestProvider(providerResults, title, anime.episodes);
+            currentShowId = bestMatch.id;
             const episodes = await invoke('get_episodes', {
                 showId: currentShowId,
                 mode: 'sub',
@@ -468,14 +510,16 @@ function renderEpisodes(episodes, watchedSet) {
     });
 }
 
-// Fix 3: determine barrel name from current anime context
 function determineBarrel() {
     if (!currentAnime) return '';
     const format = currentAnime.format;
-    if (format === 'MOVIE') return 'Movies';
-    if (format === 'OVA' || format === 'ONA' || format === 'SPECIAL') return 'OVAs';
-    if (currentAnime.season && currentAnime.season_year) {
-        return `${currentAnime.season_year} ${currentAnime.season}`;
+    const inChain = currentSeasonInfo && currentSeasonInfo.in_chain;
+
+    if (format === 'MOVIE' && !inChain) return 'Movies';
+    if ((format === 'OVA' || format === 'ONA' || format === 'SPECIAL') && !inChain) return 'OVAs';
+
+    if (currentSeasonInfo && currentSeasonInfo.season_number) {
+        return `Season ${currentSeasonInfo.season_number}`;
     }
     return 'Season 1';
 }
@@ -684,7 +728,6 @@ function trySource(title, epNumber) {
     const total = currentSources.length;
     const current = currentSourceIndex + 1;
 
-    // Fix 6: warn about non-mp4 formats
     if (!source.url.includes('.mp4')) {
         $('#status-line').textContent = `[source ${current}/${total}: ${source.provider} ${source.quality} (non-mp4)]`;
         $('#status-line').classList.add('warning');
@@ -739,7 +782,6 @@ function trySource(title, epNumber) {
     });
 }
 
-// Fix 6: warn on mpv fallback
 async function fallbackToMpv(title, epNumber) {
     if (currentSources.length === 0) {
         showWarning('no playable sources found');
@@ -901,7 +943,6 @@ function renderDownloadList(downloads) {
     });
 }
 
-// Fix 8: auto-refresh downloads view
 function startDownloadRefresh() {
     stopDownloadRefresh();
     downloadRefreshInterval = setInterval(async () => {
@@ -919,7 +960,6 @@ function stopDownloadRefresh() {
     if (downloadRefreshInterval) { clearInterval(downloadRefreshInterval); downloadRefreshInterval = null; }
 }
 
-// Fix 8: handle unknown total size in progress events
 listen('download-progress', (event) => {
     const { id, progress, downloaded } = event.payload;
     const item = $(`.download-item[data-download-id="${id}"]`);

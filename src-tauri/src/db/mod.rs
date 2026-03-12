@@ -92,19 +92,15 @@ impl Database {
             INSERT OR IGNORE INTO settings (key, value) VALUES ('download_dir', '~/Shizuku');
             ",
         )?;
-        // Migrations for existing databases
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN barrel TEXT NOT NULL DEFAULT '';").ok();
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN series_title TEXT NOT NULL DEFAULT '';").ok();
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN show_id TEXT NOT NULL DEFAULT '';").ok();
-        // Reset stale downloads — if app just started, nothing can be actively downloading
         conn.execute(
             "UPDATE downloads SET status = 'failed' WHERE status = 'downloading' OR status = 'queued'",
             [],
         ).ok();
         Ok(())
     }
-
-    // --- Settings ---
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
@@ -124,8 +120,6 @@ impl Database {
         Ok(())
     }
 
-    // --- Cache ---
-
     pub fn get_cache(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let result = conn
@@ -141,12 +135,9 @@ impl Database {
             "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?1, ?2, datetime('now', '+' || ?3 || ' seconds'))",
             rusqlite::params![key, value, ttl_seconds],
         )?;
-        // Opportunistic cleanup
         conn.execute("DELETE FROM cache WHERE expires_at <= datetime('now')", []).ok();
         Ok(())
     }
-
-    // --- Watch History ---
 
     pub fn add_to_history(&self, anime_id: i64, title: &str, episode: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -208,9 +199,6 @@ impl Database {
         Ok(rows)
     }
 
-    // --- Downloads ---
-
-    /// Returns Some(download_id) if queued, None if already complete or in-progress
     pub fn queue_download(
         &self,
         anime_id: i64,
@@ -319,7 +307,6 @@ impl Database {
         Ok(())
     }
 
-    /// Reset all failed downloads to 'queued' for retry
     pub fn retry_failed_downloads(&self) -> Result<i32> {
         let conn = self.conn.lock().unwrap();
         let count = conn.execute(
@@ -329,14 +316,12 @@ impl Database {
         Ok(count as i32)
     }
 
-    /// Delete a download entry
     pub fn delete_download(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM downloads WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
 
-    /// Clear all completed downloads from the list
     pub fn clear_completed_downloads(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM downloads WHERE status = 'complete'", [])?;
@@ -356,8 +341,6 @@ impl Database {
             .flatten();
         Ok(result)
     }
-
-    // --- Mokuroku (Watchlist) ---
 
     pub fn add_to_mokuroku(&self, anime_id: i64, title: &str, cover_image: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();

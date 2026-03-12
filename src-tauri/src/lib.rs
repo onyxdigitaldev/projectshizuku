@@ -47,8 +47,6 @@ impl AppState {
     }
 }
 
-// --- AniList commands ---
-
 #[tauri::command]
 async fn search_anime(
     state: tauri::State<'_, Arc<AppState>>,
@@ -107,11 +105,77 @@ async fn get_anime_detail(
     state: tauri::State<'_, Arc<AppState>>,
     id: i64,
 ) -> Result<Anime, String> {
-    state
-        .anilist
-        .get_anime(id)
-        .await
-        .map_err(|e| e.to_string())
+    let cache_key = format!("anime_detail:{}", id);
+    if let Ok(Some(cached)) = state.db.get_cache(&cache_key) {
+        if let Ok(parsed) = serde_json::from_str::<Anime>(&cached) {
+            return Ok(parsed);
+        }
+    }
+    let result = state.anilist.get_anime(id).await.map_err(|e| e.to_string())?;
+    if let Ok(json) = serde_json::to_string(&result) {
+        let _ = state.db.set_cache(&cache_key, &json, 1800);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn resolve_season_number(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<serde_json::Value, String> {
+    let mut current_id = id;
+    let mut depth = 0;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(current_id);
+
+    while depth < 30 {
+        let anime = {
+            let cache_key = format!("anime_detail:{}", current_id);
+            if let Ok(Some(cached)) = state.db.get_cache(&cache_key) {
+                serde_json::from_str::<Anime>(&cached).ok()
+            } else {
+                let fetched = state.anilist.get_anime(current_id).await.ok();
+                if let Some(ref a) = fetched {
+                    if let Ok(json) = serde_json::to_string(a) {
+                        let _ = state.db.set_cache(&cache_key, &json, 1800);
+                    }
+                }
+                fetched
+            }
+        };
+
+        let anime = match anime {
+            Some(a) => a,
+            None => break,
+        };
+
+        let prequel = anime.relations.iter().find(|r| r.relation_type == "PREQUEL");
+        match prequel {
+            Some(p) => {
+                if visited.contains(&p.id) {
+                    break;
+                }
+                visited.insert(p.id);
+                current_id = p.id;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+
+    // Check if this anime is in a chain at all (has prequel or sequel)
+    let in_chain = depth > 0 || {
+        let cache_key = format!("anime_detail:{}", id);
+        state.db.get_cache(&cache_key).ok().flatten()
+            .and_then(|c| serde_json::from_str::<Anime>(&c).ok())
+            .map(|a| a.relations.iter().any(|r| r.relation_type == "SEQUEL"))
+            .unwrap_or(false)
+    };
+
+    Ok(serde_json::json!({
+        "season_number": depth + 1,
+        "in_chain": in_chain
+    }))
 }
 
 #[tauri::command]
@@ -133,8 +197,6 @@ async fn browse_genre(
     }
     Ok(result)
 }
-
-// --- AllAnime provider commands ---
 
 #[tauri::command]
 async fn provider_search(
@@ -176,8 +238,6 @@ async fn get_episode_sources(
         .map_err(|e| e.to_string())
 }
 
-// --- History commands ---
-
 #[tauri::command]
 async fn add_to_history(
     state: tauri::State<'_, Arc<AppState>>,
@@ -213,8 +273,6 @@ async fn get_watched_episodes(
     state.db.get_watched_episodes(anime_id).map_err(|e| e.to_string())
 }
 
-// --- Download commands ---
-
 #[tauri::command]
 async fn get_downloads(
     state: tauri::State<'_, Arc<AppState>>,
@@ -240,8 +298,6 @@ async fn check_local_file(
     Ok(path)
 }
 
-// Fix 4: barrel parameter for organized folders
-// Fix 6: returns format string ("mp4" or "m3u8") for frontend warnings
 #[tauri::command]
 async fn start_download(
     app_handle: tauri::AppHandle,
@@ -254,7 +310,27 @@ async fn start_download(
     barrel: String,
     series_title: String,
 ) -> Result<String, String> {
-    // Check DB first — skip if already complete or in-progress (avoids unnecessary API calls)
+    // Filesystem duplicate check — catches case where DB is empty but files exist
+    {
+        let download_dir = state.download_dir();
+        let folder_name = if series_title.is_empty() { &anime_title } else { &series_title };
+        let safe_title = folder_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
+            .collect::<String>();
+        let anime_dir = download_dir.join(&safe_title);
+        let target_dir = if barrel.is_empty() { anime_dir } else { anime_dir.join(&barrel) };
+        let file_path = target_dir.join(format!("Episode_{}.mp4", episode));
+        if file_path.exists() {
+            if let Ok(meta) = file_path.metadata() {
+                if meta.len() > 0 {
+                    return Ok("skipped".to_string());
+                }
+            }
+        }
+    }
+
+    // Check DB — skip if already complete or in-progress (avoids unnecessary API calls)
     let download_id = match state
         .db
         .queue_download(
@@ -516,7 +592,6 @@ async fn retry_failed_downloads(
     Ok(count)
 }
 
-/// Shared download spawner — used by start_download and retry_failed_downloads
 fn spawn_download(
     app_handle: tauri::AppHandle,
     state: Arc<AppState>,
@@ -576,6 +651,16 @@ fn spawn_download(
 
         let file_name = format!("Episode_{}.mp4", episode);
         let fp = target_dir.join(&file_name).to_string_lossy().to_string();
+
+        // Filesystem duplicate check
+        {
+            let path = std::path::Path::new(&fp);
+            if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                let _ = state.db.update_download_complete(download_id, &fp);
+                let _ = app_handle.emit("download-complete", serde_json::json!({ "id": download_id, "file_path": fp }));
+                return;
+            }
+        }
 
         let is_m3u8 = source.url.contains("m3u8");
 
@@ -642,8 +727,6 @@ async fn clear_completed_downloads(
     state.db.clear_completed_downloads().map_err(|e| e.to_string())
 }
 
-// --- Mokuroku (Watchlist) commands ---
-
 #[tauri::command]
 async fn add_to_mokuroku(
     state: tauri::State<'_, Arc<AppState>>,
@@ -686,8 +769,6 @@ async fn is_in_mokuroku(
         .map_err(|e| e.to_string())
 }
 
-// --- Settings commands ---
-
 #[tauri::command]
 async fn get_settings(
     state: tauri::State<'_, Arc<AppState>>,
@@ -717,7 +798,6 @@ async fn set_setting(
     state.db.set_setting(&key, &value).map_err(|e| e.to_string())
 }
 
-// Simple adult content toggle — no auth, just confirmation from frontend
 #[tauri::command]
 async fn toggle_adult_content(
     state: tauri::State<'_, Arc<AppState>>,
@@ -731,15 +811,11 @@ async fn toggle_adult_content(
     Ok(!current)
 }
 
-// --- Quit command ---
-
 #[tauri::command]
 async fn quit_app(app_handle: tauri::AppHandle) -> Result<(), String> {
     app_handle.exit(0);
     Ok(())
 }
-
-// --- mpv fallback command ---
 
 #[tauri::command]
 async fn play_in_mpv(
@@ -788,6 +864,7 @@ pub fn run() {
             get_trending,
             get_recently_updated,
             get_anime_detail,
+            resolve_season_number,
             browse_genre,
             provider_search,
             get_episodes,
