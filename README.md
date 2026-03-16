@@ -15,7 +15,11 @@ A personal anime streaming and management desktop app with a terminal-inspired a
 
 ## Screenshots
 
-*Terminal-inspired dark UI with anime card grids, episode lists with download buttons, and a built-in video player.*
+![Home](screenshots/home.png)
+![Anime Detail](screenshots/detail.png)
+![Episodes](screenshots/episodes.png)
+![Genre Browse](screenshots/genre-browse-1.png)
+![Genre Browse](screenshots/genre-browse-2.png)
 
 ## Installation
 
